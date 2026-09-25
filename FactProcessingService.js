@@ -1,6 +1,7 @@
 /**
  * [SERVICE] FactProcessingService.js
- * Xử lý bùng nổ BOM, ánh xạ món bán thành NVL và tổng hợp Fact Inbound / Outbound
+ * Xử lý ETL, bùng nổ BOM và tổng hợp Fact Data.
+ * Tuân thủ quy ước V2 Schema-Driven & ghi dữ liệu thuần túy qua UPSERT.
  */
 class FactProcessingService {
   constructor(tableRepo, schemaService, bomService = null) {
@@ -10,54 +11,43 @@ class FactProcessingService {
   }
 
   /**
-   * Helper: Chuẩn hóa chuỗi period về dạng thuần số để so sánh chính xác (VD: "2026-09" -> "202609")
+   * Helper chuyển đổi col_index từ Schema (1-based) sang mảng JavaScript (0-based)
+   * @param {string} tableName 
+   * @param {string} colKey 
+   * @returns {number} Chỉ số 0-based trong mảng JS, hoặc -1 nếu không tìm thấy
+   */
+  _getColIndex(tableName, colKey) {
+    if (!this.schemaService) return -1;
+    const schemaMap = this.schemaService.getSchemaMap();
+    const colIndex1Based = this.schemaService.getColIndex(schemaMap, tableName, colKey);
+
+    if (colIndex1Based !== undefined && colIndex1Based !== null && !isNaN(colIndex1Based)) {
+      const numIdx = Number(colIndex1Based);
+      return numIdx >= 1 ? numIdx - 1 : -1;
+    }
+    return -1;
+  }
+
+  /**
+   * Chuẩn hóa chuỗi period về dạng thuần số để so sánh/lọc (VD: "2026-09" -> "202609")
    */
   _normalizePeriod(p) {
-    if (!p) return "";
+    if (p === null || p === undefined) return "";
     return String(p).replace(/[-_\s]/g, "").trim();
   }
 
   /**
-   * Helper: Xóa sạch toàn bộ dữ liệu Fact thuộc các kỳ bị ảnh hưởng
+   * Helper format hoặc ép kiểu ngày chứng từ về dạng Date hoặc String an toàn cho GSheet
    */
-  _clearExistingFactDataByPeriods(tableName, affectedPeriods) {
-    if (!affectedPeriods || affectedPeriods.size === 0) return;
-
-    // Chuẩn hóa danh sách kỳ bị ảnh hưởng thành Set chuỗi số thuần
-    const normalizedAffectedSet = new Set(
-      Array.from(affectedPeriods).map(p => this._normalizePeriod(p))
-    );
-
-    const factInfo = this.tableRepo.getDataByTableName(tableName);
-    const factRows = factInfo ? factInfo.values : [];
-    if (!factRows || factRows.length <= 1) return;
-
-    const periodIdx = this._getColIndex(tableName, "period");
-    if (periodIdx === -1) return;
-
-    const filteredRows = [factRows[0]]; // Giữ lại Header
-    let removedCount = 0;
-
-    for (let i = 1; i < factRows.length; i++) {
-      const pRaw = factRows[i][periodIdx];
-      const pNorm = this._normalizePeriod(pRaw);
-
-      if (normalizedAffectedSet.has(pNorm)) {
-        removedCount++;
-      } else {
-        filteredRows.push(factRows[i]);
-      }
-    }
-
-    if (removedCount > 0) {
-      this.tableRepo.updateTableData(tableName, filteredRows);
-      Logger.log(`[FACT CLEANUP] Đã làm sạch ${removedCount} dòng cũ trên [${tableName}] thuộc các kỳ: ${Array.from(affectedPeriods).join(", ")}`);
-    }
+  _formatDateValue(rawDate) {
+    if (!rawDate) return "";
+    if (rawDate instanceof Date) return rawDate;
+    const d = new Date(rawDate);
+    return isNaN(d.getTime()) ? String(rawDate) : d;
   }
 
   /**
-   * 1. Tổng hợp FACT_INBOUND từ STG_PO_INVOICE
-   * @param {string|null} targetPeriod - Kỳ cần lọc từ Controller
+   * 1. Tổng hợp FACT_INBOUND từ STG_PO_INVOICE (Tuân thủ quy ước UPSERT)
    */
   processFactInbound(targetPeriod = null) {
     const targetPeriodNorm = this._normalizePeriod(targetPeriod);
@@ -78,7 +68,6 @@ class FactProcessingService {
     const stgAmtIdx      = this._getColIndex("STG_PO_INVOICE", "amount");
     const stgTaxAmtIdx   = this._getColIndex("STG_PO_INVOICE", "tax_amount");
 
-    // LỌC TẠI NGUỒN STAGING
     const validStgRows = [];
     for (let i = 1; i < stgRows.length; i++) {
       const r = stgRows[i];
@@ -93,11 +82,11 @@ class FactProcessingService {
     }
 
     if (validStgRows.length === 0) {
-      Logger.log(`[FACT INBOUND] Không tìm thấy dữ liệu Staging thỏa mãn điều kiện kỳ [${targetPeriodNorm || "ALL"}].`);
+      Logger.log(`[FACT INBOUND] Không tìm thấy dữ liệu Staging phù hợp cho kỳ [${targetPeriodNorm || "ALL"}].`);
       return 0;
     }
 
-    // Load Mapping item_code -> ingredient_code từ ITEM_MASTER
+    // Mapping item_code -> ingredient_code từ ITEM_MASTER
     const imInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
     const imRows = imInfo ? imInfo.values : [];
     const itemIngrMap = {};
@@ -113,7 +102,6 @@ class FactProcessingService {
     }
 
     const factInboundRows = [];
-    const affectedPeriods = new Set();
 
     for (let i = 0; i < validStgRows.length; i++) {
       const r = validStgRows[i];
@@ -123,10 +111,11 @@ class FactProcessingService {
       const basePrice = Number(r[stgBasePrcIdx]) || 0;
       const amount    = Number(r[stgAmtIdx]) || (baseQty * basePrice);
       const taxAmt    = Number(r[stgTaxAmtIdx]) || 0;
+      const invDate   = this._formatDateValue(r[stgDateIdx]);
 
       const row = [
         rPeriod,
-        r[stgDateIdx],
+        invDate,
         r[stgCodeIdx],
         r[stgLineIdx],
         itemCode,
@@ -140,24 +129,19 @@ class FactProcessingService {
       ];
 
       factInboundRows.push(row);
-      if (rPeriod) affectedPeriods.add(rPeriod);
     }
 
     if (factInboundRows.length > 0) {
-      // 1. Tẩy sạch dữ liệu cũ thuộc các kỳ bị ảnh hưởng
-      this._clearExistingFactDataByPeriods("FACT_INBOUND", affectedPeriods);
-
-      // 2. Ghi mới dữ liệu dạng Append (Tránh lỗi trôi cột hoặc ghi đè sót cột từ Upsert)
-      this.tableRepo.appendRowsByTableName("FACT_INBOUND", factInboundRows);
-      Logger.log(`[FACT INBOUND] Đã ghi thành công ${factInboundRows.length} dòng dữ liệu mới cho các kỳ: ${Array.from(affectedPeriods).join(", ")}`);
+      // Thực thi UPSERT theo khóa chính kết hợp ["doc_code", "line_no", "item_code"]
+      this.tableRepo.upsertRowsByTableName("FACT_INBOUND", factInboundRows, ["doc_code", "line_no", "item_code"]);
+      Logger.log(`[FACT INBOUND] Thực thi UPSERT hoàn tất cho ${factInboundRows.length} dòng Fact Inbound.`);
     }
 
     return factInboundRows.length;
   }
 
   /**
-   * 2. Tổng hợp FACT_OUTBOUND từ STG_SO_INVOICE
-   * @param {string|null} targetPeriod - Kỳ cần lọc từ Controller
+   * 2. Tổng hợp FACT_OUTBOUND từ STG_SO_INVOICE (Tuân thủ quy ước UPSERT)
    */
   processFactOutbound(targetPeriod = null) {
     const targetPeriodNorm = this._normalizePeriod(targetPeriod);
@@ -187,10 +171,7 @@ class FactProcessingService {
       validStgRows.push(r);
     }
 
-    if (validStgRows.length === 0) {
-      Logger.log(`[FACT OUTBOUND] Không tìm thấy dữ liệu Staging SO thỏa mãn điều kiện kỳ [${targetPeriodNorm || "ALL"}].`);
-      return 0;
-    }
+    if (validStgRows.length === 0) return 0;
 
     const avgCostMap = this._buildAvgUnitCostMap();
     const allocationRulesMap = this._loadAllocationRules();
@@ -210,14 +191,13 @@ class FactProcessingService {
     }
 
     const factOutboundRows = [];
-    const affectedPeriods = new Set();
 
     for (let i = 0; i < validStgRows.length; i++) {
       const r = validStgRows[i];
       const rPeriod    = String(r[stgPeriodIdx] || "").trim();
       const parentCode = String(r[stgItemCodeIdx] || "").trim();
       const soldQty    = Number(r[stgQtyIdx]) || 0;
-      const transDate  = r[stgDateIdx];
+      const transDate  = this._formatDateValue(r[stgDateIdx]);
 
       const overheadRate = this._resolveAllocationRate(transDate, rPeriod, allocationRulesMap);
 
@@ -279,22 +259,20 @@ class FactProcessingService {
           totalCost
         ]);
       }
-
-      if (rPeriod) affectedPeriods.add(rPeriod);
     }
 
     if (factOutboundRows.length > 0) {
-      // 1. Tẩy sạch dữ liệu cũ thuộc các kỳ bị ảnh hưởng
-      this._clearExistingFactDataByPeriods("FACT_OUTBOUND", affectedPeriods);
-
-      // 2. Ghi mới dữ liệu dạng Append
-      this.tableRepo.appendRowsByTableName("FACT_OUTBOUND", factOutboundRows);
-      Logger.log(`[FACT OUTBOUND] Đã tạo thành công ${factOutboundRows.length} dòng dữ liệu cho các kỳ: ${Array.from(affectedPeriods).join(", ")}`);
+      // Thực thi UPSERT theo khóa chính kết hợp cho Fact Outbound
+      this.tableRepo.upsertRowsByTableName("FACT_OUTBOUND", factOutboundRows, ["doc_code", "line_no", "parent_code", "ingredient_code"]);
+      Logger.log(`[FACT OUTBOUND] Thực thi UPSERT hoàn tất cho ${factOutboundRows.length} dòng Fact Outbound.`);
     }
 
     return factOutboundRows.length;
   }
 
+  /**
+   * Helper: Tính giá vốn bình quân theo mã nguyên liệu từ FACT_INBOUND
+   */
   _buildAvgUnitCostMap() {
     const factIn = this.tableRepo.getDataByTableName("FACT_INBOUND");
     const rows = factIn ? factIn.values : [];
@@ -326,16 +304,19 @@ class FactProcessingService {
     return avgMap;
   }
 
+  /**
+   * Helper: Tải danh sách quy tắc phân bổ chi phí chung theo Schema ALLOCATION_RULE
+   */
   _loadAllocationRules() {
-    const rulesTable = this.tableRepo.getDataByTableName("OVERHEAD_ALLOCATION_RULE");
+    const rulesTable = this.tableRepo.getDataByTableName("ALLOCATION_RULE");
     const rows = rulesTable ? rulesTable.values : [];
     const list = [];
 
     if (rows && rows.length > 1) {
-      const rateIdx = this._getColIndex("OVERHEAD_ALLOCATION_RULE", "allocation_rate");
-      const fromIdx = this._getColIndex("OVERHEAD_ALLOCATION_RULE", "effective_from");
-      const toIdx   = this._getColIndex("OVERHEAD_ALLOCATION_RULE", "effective_to");
-      const actIdx  = this._getColIndex("OVERHEAD_ALLOCATION_RULE", "is_active");
+      const rateIdx = this._getColIndex("ALLOCATION_RULE", "allocation_rate");
+      const fromIdx = this._getColIndex("ALLOCATION_RULE", "effective_from");
+      const toIdx   = this._getColIndex("ALLOCATION_RULE", "effective_to");
+      const actIdx  = this._getColIndex("ALLOCATION_RULE", "is_active");
 
       for (let i = 1; i < rows.length; i++) {
         const isActive = rows[i][actIdx] === true || String(rows[i][actIdx]).toUpperCase() === "TRUE";
@@ -351,6 +332,9 @@ class FactProcessingService {
     return list;
   }
 
+  /**
+   * Helper: Tìm tỷ lệ phân bổ chi phí chung phù hợp với ngày chứng từ
+   */
   _resolveAllocationRate(transDate, period, rules) {
     if (!rules || rules.length === 0) return 0;
 
@@ -364,16 +348,5 @@ class FactProcessingService {
     });
 
     return matchedRule ? matchedRule.rate : 0;
-  }
-
-  _getColIndex(tableName, colKey) {
-    if (!this.schemaService) return -1;
-    const schemaMap = this.schemaService.getSchemaMap();
-    const idx = this.schemaService.getColIndex(schemaMap, tableName, colKey);
-    if (idx !== undefined && idx !== null && !isNaN(idx)) {
-      const numIdx = Number(idx);
-      return numIdx > 0 ? numIdx - 1 : numIdx;
-    }
-    return -1;
   }
 }
