@@ -83,7 +83,7 @@ function testDataStagingService() {
           ["2026-04", "INV-002", "2026-04-11", 1, "Ba chỉ bò cuộn 450G", "KKKNT", "Khay", "5", "65000", "325000", "0"]
         ];
       }
-      if (schemaName === "MAP_RULES") {
+      if (schemaName === "MAP_RULE") {
         return [
           // [source_grp, raw_name, item_name, item_code]
           ["INT", "Cá hồi tươi Nauy Fillet", "Ca hoi tuoi Nauy Fillet", "INT_CA_HOI_NAUY"],
@@ -130,5 +130,30 @@ function testDataStagingService() {
     Logger.log("=== UNIT TEST HOÀN TẤT THÀNH CÔNG ===");
   } catch (error) {
     Logger.log(`[ERROR UNIT TEST] Lỗi thực thi: ${error.message} - Stack: ${error.stack}`);
+  }
+}
+
+
+
+/**
+ * Trigger chạy Bootstrap BOM từ UI Menu
+ */
+function menuBootstrapBOM() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const tableRepo = new TableRepository();
+    const bomService = new BomService(tableRepo);
+
+    SpreadsheetApp.getActiveSpreadsheet().toast("Đang nạp dữ liệu ITEM_MASTER để khởi tạo khung BOM...", "Hệ Thống", 3);
+
+    const count = bomService.bootstrapBomFromItemMaster();
+
+    if (count > 0) {
+      ui.alert("Thành Công", `Đã khởi tạo ${count} dòng cấu trúc BOM trong sheet BOM_RECIPE.\n\nVui lòng mở sheet BOM_RECIPE để điền định mức (std_qty) và mã thành phần con.`, ui.ButtonSet.OK);
+    } else {
+      ui.alert("Thông Báo", "Không có món OUT mới nào cần tạo BOM.", ui.ButtonSet.OK);
+    }
+  } catch (error) {
+    ui.alert("Lỗi Thực Thi", `Chi tiết lỗi: ${error.message}`, ui.ButtonSet.OK);
   }
 }

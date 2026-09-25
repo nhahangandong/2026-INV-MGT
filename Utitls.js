@@ -8,8 +8,8 @@ function generateTablesCatalogSheet() {
   // 1. Danh sách mô tả mặc định cho các bảng theo thiết kế hệ thống
   const defaultDescriptions = {
     "item_master": "Danh mục SKU Kho thực tế, quản lý ingredient_code (Mã BOM) và std_factor_to_base",
-    "auto_map_rules": "Quy tắc Wildcard/Regex chuẩn hóa chính tả, từ vựng và biến thể tên gọi",
-    "map_rules": "Bảng kết quả ánh xạ raw_name chứng từ sang item_code hệ thống",
+    "auto_map_rule": "Quy tắc Wildcard/Regex chuẩn hóa chính tả, từ vựng và biến thể tên gọi",
+    "map_rule": "Bảng kết quả ánh xạ raw_name chứng từ sang item_code hệ thống",
     "unit_conversion": "Bảng tra cứu tỷ lệ quy đổi đơn vị tính nâng cao theo quy cách đóng gói",
     "recipe_bom": "Định mức công thức chế biến/sản xuất (quản lý theo ingredient_code)",
     "stg_po": "Dữ liệu Staging Hóa đơn / PO Mua hàng đầu vào",
@@ -40,7 +40,7 @@ function generateTablesCatalogSheet() {
     let group = "Nghiệp vụ / Báo cáo";
     
     // Phân loại nhóm bảng
-    if (["item_master", "auto_map_rules", "map_rules", "unit_conversion", "recipe_bom"].includes(name)) {
+    if (["item_master", "auto_map_rule", "map_rule", "unit_conversion", "recipe_bom"].includes(name)) {
       group = "Master Data / Rules";
     } else if (name.startsWith("stg_") || name.startsWith("raw_")) {
       group = "Staging / Transaction";
