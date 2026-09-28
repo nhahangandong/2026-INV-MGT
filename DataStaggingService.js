@@ -244,7 +244,7 @@ class DataStagingService {
 
   /**
    * BƯỚC 2: Sinh mã item_code tự động từ item_name chuẩn & Sync sang ITEM_MASTER
-   * Luồng chuẩn: MAP_RULE (source_grp + item_name) -> Sinh item_code -> Sync sang ITEM_MASTER
+   * Tích hợp gán nhãn trạng thái 'NEED_REVIEW' vào cột status cho các mã mồ côi
    */
   generateAndSyncItemCodes() {
     Logger.log(`[GEN CODE] Bắt đầu sinh mã item_code từ tên chuẩn...`);
@@ -256,12 +256,13 @@ class DataStagingService {
 
     const schemaMap = this.schemaService.getSchemaMap();
     const imColsConfig = schemaMap["ITEM_MASTER"] ? schemaMap["ITEM_MASTER"].columns : {};
-    const totalIMCols = Math.max(...Object.values(imColsConfig), 3);
+    const totalIMCols = Math.max(...Object.values(imColsConfig), 8);
 
     const idxIM = {
       itemCode:  this._getColIndex("ITEM_MASTER", "item_code"),
       sourceGrp: this._getColIndex("ITEM_MASTER", "source_grp"),
-      itemName:  this._getColIndex("ITEM_MASTER", "item_name")
+      itemName:  this._getColIndex("ITEM_MASTER", "item_name"),
+      status:    this._getColIndex("ITEM_MASTER", "status") // Cột status mới thêm
     };
 
     const idxMR = {
@@ -271,7 +272,6 @@ class DataStagingService {
       itemCode:  this._getColIndex("MAP_RULE", "item_code")
     };
 
-    // Đọc thông tin các dòng hiện có của ITEM_MASTER để giữ lại các cột dữ liệu khác nếu có (như inventory_sku, item_type)
     const existingIMRowsByName = {}; 
     const itemRows = itemMasterInfo && itemMasterInfo.values ? itemMasterInfo.values.slice(1) : [];
 
@@ -280,15 +280,16 @@ class DataStagingService {
       if (name) {
         const fullRow = [...row];
         while (fullRow.length < totalIMCols) fullRow.push("");
-        // Lưu dòng cũ theo key item_name (KHÔNG ĐỌC HOẶC TÁI SỬ DỤNG ITEM_CODE CỦ TRONG ITEM_MASTER)
         existingIMRowsByName[name.toLowerCase().replace(/\s+/g, " ")] = fullRow;
       }
     });
 
     const mapRows = mapRuleInfo.values.slice(1);
     const newMasterRowsMap = new Map();
+    const activeCodeSet = new Set();
     let generatedCount = 0;
 
+    // 1. Duyệt MAP_RULE sinh mã chuẩn
     mapRows.forEach(row => {
       const sourceGrp = String(row[idxMR.sourceGrp] || "INT").trim().toUpperCase();
       const itemName  = String(row[idxMR.itemName] || "").trim();
@@ -297,22 +298,20 @@ class DataStagingService {
 
       const cleanItemKey = itemName.toLowerCase().replace(/\s+/g, " ");
 
-      // SINH MÃ CHUẨN TỰ ĐỘNG BẰNG HÀM SLUGIFY TỪ ITEM_NAME
       const cleanNameNoTone = this._removeVietnameseTones(itemName)
-        .replace(/[^a-zA-Z0-9\s_]/g, "") // Loại bỏ các ký tự đặc biệt
+        .replace(/[^a-zA-Z0-9\s_]/g, "")
         .trim()
         .replace(/\s+/g, "_")
         .toUpperCase();
       
       const correctCode = `${sourceGrp}_${cleanNameNoTone}`;
+      activeCodeSet.add(correctCode);
 
-      // 1. Cập nhật mã chuẩn tuyệt đối vào MAP_RULE (Sửa đè mã sai cũ nếu có)
       if (row[idxMR.itemCode] !== correctCode) {
         row[idxMR.itemCode] = correctCode;
         generatedCount++;
       }
 
-      // 2. Chuẩn bị dữ liệu đồng bộ đè sang ITEM_MASTER
       let masterRow = existingIMRowsByName[cleanItemKey] 
         ? [...existingIMRowsByName[cleanItemKey]] 
         : new Array(totalIMCols).fill("");
@@ -320,18 +319,45 @@ class DataStagingService {
       if (idxIM.itemCode !== -1)  masterRow[idxIM.itemCode]  = correctCode;
       if (idxIM.sourceGrp !== -1) masterRow[idxIM.sourceGrp] = sourceGrp;
       if (idxIM.itemName !== -1)  masterRow[idxIM.itemName]  = itemName;
+      
+      // Xóa nhãn cảnh báo nếu mã nằm trong danh sách hoạt động
+      if (idxIM.status !== -1 && masterRow[idxIM.status] === "NEED_REVIEW") {
+        masterRow[idxIM.status] = "ACTIVE";
+      }
 
       newMasterRowsMap.set(cleanItemKey, masterRow);
     });
 
-    // Sync 1 chiều từ MAP_RULE đẩy đè lại ITEM_MASTER
+    // 2. Cập nhật MAP_RULE
+    if (mapRows.length > 0) {
+      this.tableRepo.upsertRowsByTableName("MAP_RULE", mapRows, ["source_grp", "raw_name"]);
+    }
+
+    // 3. Upsert mã chuẩn sang ITEM_MASTER
     if (newMasterRowsMap.size > 0) {
       const masterRowsToUpsert = Array.from(newMasterRowsMap.values());
       this.tableRepo.upsertRowsByTableName("ITEM_MASTER", masterRowsToUpsert, ["item_code"]);
     }
 
-    if (mapRows.length > 0) {
-      this.tableRepo.upsertRowsByTableName("MAP_RULE", mapRows, ["source_grp", "raw_name"]);
+    // 4. GÁN NHÃN CẢNH BÁO 'NEED_REVIEW' VÀO CỘT STATUS CHO CÁC MÃ MỒ CÔI
+    const updatedIMInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
+    if (updatedIMInfo && updatedIMInfo.values && updatedIMInfo.values.length > 1 && idxIM.status !== -1) {
+      const currentIMRows = updatedIMInfo.values.slice(1);
+      const flaggedRows = [];
+
+      currentIMRows.forEach(row => {
+        const code = String(row[idxIM.itemCode] || "").trim();
+        // Mã tồn tại trong ITEM_MASTER nhưng không xuất hiện trong MAP_RULE hiện tại
+        if (code && !activeCodeSet.has(code)) {
+          row[idxIM.status] = "NEED_REVIEW";
+          flaggedRows.push(row);
+        }
+      });
+
+      if (flaggedRows.length > 0) {
+        this.tableRepo.upsertRowsByTableName("ITEM_MASTER", flaggedRows, ["item_code"]);
+        Logger.log(`[FLAG ORPHANS] Đã cập nhật status = NEED_REVIEW cho ${flaggedRows.length} mã mồ côi.`);
+      }
     }
 
     Logger.log(`[GEN CODE] Hoàn tất sinh & đồng bộ ${generatedCount} mã item_code chuẩn.`);
