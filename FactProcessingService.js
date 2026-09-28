@@ -1,352 +1,276 @@
 /**
  * [SERVICE] FactProcessingService.js
- * Xử lý ETL, bùng nổ BOM và tổng hợp Fact Data.
- * Tuân thủ quy ước V2 Schema-Driven & ghi dữ liệu thuần túy qua UPSERT.
+ * Xử lý tính toán và đổ dữ liệu từ STG sang FACT.
+ * Sử dụng Dynamic Column Mapping & Index Projection từ SchemaService.
  */
 class FactProcessingService {
-  constructor(tableRepo, schemaService, bomService = null) {
+  constructor(tableRepo, schemaService, sysConfigService = null, bomService = null) {
+    if (!tableRepo || !schemaService) {
+      throw new Error("[FactProcessingService] Thiếu Dependency bắt buộc (tableRepo, schemaService).");
+    }
     this.tableRepo = tableRepo;
     this.schemaService = schemaService;
+    this.sysConfigService = sysConfigService;
     this.bomService = bomService;
+    this.KEY_DELIMITER = "___";
   }
 
   /**
-   * Helper chuyển đổi col_index từ Schema (1-based) sang mảng JavaScript (0-based)
-   * @param {string} tableName 
-   * @param {string} colKey 
-   * @returns {number} Chỉ số 0-based trong mảng JS, hoặc -1 nếu không tìm thấy
+   * Helper lấy 0-based index từ SchemaService (Chuẩn API 3 tham số)
    */
-  _getColIndex(tableName, colKey) {
-    if (!this.schemaService) return -1;
+  _getColIndex(schemaName, colKey) {
+    const schemaMap = (typeof this.schemaService.getSchemaMap === 'function') 
+      ? this.schemaService.getSchemaMap() 
+      : null;
+    const col1Based = this.schemaService.getColIndex(schemaMap, schemaName, colKey);
+    return col1Based > 0 ? col1Based - 1 : -1;
+  }
+
+  /**
+   * Helper đọc cấu hình JSON từ SYSTEM_CONFIG
+   */
+  _getSysConfigJson(configKey, fallbackValue = {}) {
+    if (!this.sysConfigService) return fallbackValue;
+    try {
+      let rawVal = null;
+      if (typeof this.sysConfigService.getValue === 'function') {
+        rawVal = this.sysConfigService.getValue(configKey);
+      } else if (typeof this.sysConfigService.getConfig === 'function') {
+        rawVal = this.sysConfigService.getConfig(configKey);
+      }
+
+      if (!rawVal) return fallbackValue;
+      return (typeof rawVal === 'string') ? JSON.parse(rawVal) : rawVal;
+    } catch (e) {
+      Logger.log(`[WARN] Lỗi parse JSON cho configKey '${configKey}': ${e.message}`);
+      return fallbackValue;
+    }
+  }
+
+  /**
+   * Dựng Dict tra cứu UNIT_CONVERSION
+   */
+  _buildUnitConversionDictionary(sourceGroup) {
+    const ucInfo = this.tableRepo.getDataByTableName("UNIT_CONVERSION");
+    const ucRows = ucInfo ? ucInfo.values : [];
+    const dict = {};
+
+    if (ucRows && ucRows.length > 1) {
+      const grpIdx    = this._getColIndex("UNIT_CONVERSION", "source_grp");
+      const codeIdx   = this._getColIndex("UNIT_CONVERSION", "item_code");
+      const altIdx    = this._getColIndex("UNIT_CONVERSION", "alt_unit");
+      const baseIdx   = this._getColIndex("UNIT_CONVERSION", "base_unit");
+      const factorIdx = this._getColIndex("UNIT_CONVERSION", "conversion_factor");
+
+      for (let i = 1; i < ucRows.length; i++) {
+        const grp     = String(ucRows[i][grpIdx] || "").trim().toUpperCase();
+        const code    = String(ucRows[i][codeIdx] || "").trim();
+        const altUnit = String(ucRows[i][altIdx] || "").trim().toLowerCase();
+        
+        if ((grp === sourceGroup || grp === "PO" || grp === "INT" || grp === "ALL") && code && altUnit) {
+          const key = [grp, code, altUnit].join(this.KEY_DELIMITER);
+          dict[key] = {
+            baseUnit: String(ucRows[i][baseIdx] || "").trim().toLowerCase(),
+            factor:   Number(ucRows[i][factorIdx]) || 1
+          };
+        }
+      }
+    }
+    return dict;
+  }
+
+  /**
+   * Dựng Dict tra cứu ITEM_MASTER
+   */
+  _buildItemMasterDictionary() {
+    const imInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
+    const imRows = imInfo ? imInfo.values : [];
+    const dict = {};
+
+    if (imRows && imRows.length > 1) {
+      const codeIdx   = this._getColIndex("ITEM_MASTER", "item_code");
+      const baseIdx   = this._getColIndex("ITEM_MASTER", "base_unit");
+      const ingIdx    = this._getColIndex("ITEM_MASTER", "ingredient_code");
+      const factorIdx = this._getColIndex("ITEM_MASTER", "stg_factor_to_base");
+
+      for (let i = 1; i < imRows.length; i++) {
+        const code = String(imRows[i][codeIdx] || "").trim();
+        if (code) {
+          dict[code] = {
+            baseUnit:       String(imRows[i][baseIdx] || "").trim().toLowerCase(),
+            ingredientCode: ingIdx !== -1 ? String(imRows[i][ingIdx] || "").trim() : "",
+            stgFactor:      factorIdx !== -1 ? (Number(imRows[i][factorIdx]) || 1) : 1
+          };
+        }
+      }
+    }
+    return dict;
+  }
+
+  /**
+   * Tra cứu hệ số quy đổi: UNIT_CONVERSION First -> ITEM_MASTER Fallback -> Default 1
+   */
+  _resolveConversionFactorAndBaseUnit(sourceGrp, itemCode, stgUnit, ucDict, imDict) {
+    const cleanGrp  = String(sourceGrp || "INT").trim().toUpperCase();
+    const cleanCode = String(itemCode || "").trim();
+    const cleanUnit = String(stgUnit || "").trim().toLowerCase();
+
+    const imInfo = imDict[cleanCode] || {};
+    let baseUnit = imInfo.baseUnit || cleanUnit;
+    let factor = 1;
+
+    // 1. Kiểm tra UNIT_CONVERSION
+    const ucKey = [cleanGrp, cleanCode, cleanUnit].join(this.KEY_DELIMITER);
+    const ucInfo = ucDict[ucKey];
+
+    if (ucInfo && Number(ucInfo.factor) > 0) {
+      factor = Number(ucInfo.factor);
+      if (ucInfo.baseUnit) baseUnit = ucInfo.baseUnit;
+    } 
+    // 2. Fallback sang ITEM_MASTER
+    else if (imInfo.stgFactor && Number(imInfo.stgFactor) > 0) {
+      factor = Number(imInfo.stgFactor);
+    }
+
+    return { factor, baseUnit };
+  }
+
+  /**
+   * BƯỚC THỰC THI: Tổng hợp Fact Inbound từ STG_PO_INVOICE sang FACT_INBOUND
+   */
+  processFactInbound(periodFilter = null) {
+    const stgSchemaKey = "STG_PO_INVOICE";
+    const factSchemaKey = "FACT_INBOUND";
+
+    // 1. Cấu hình Primary Keys từ SYSTEM_CONFIG
+    const primaryKeys = this._getSysConfigJson("FACT_INBOUND_PRIMARY_KEYS", ["doc_code", "line_no"]);
+
+    // 2. Nạp dữ liệu Staging
+    const stgInfo = this.tableRepo.getDataByTableName(stgSchemaKey);
+    const stgRows = stgInfo ? stgInfo.values : [];
+    if (!stgRows || stgRows.length <= 1) return 0;
+
+    // 3. Khởi tạo Dictionaries & Indices
+    const ucDict = this._buildUnitConversionDictionary("INT");
+    const imDict = this._buildItemMasterDictionary();
+
+    const idxSTG = {
+      period:   this._getColIndex(stgSchemaKey, "period"),
+      invDate:  this._getColIndex(stgSchemaKey, "invoice_date"),
+      invCode:  this._getColIndex(stgSchemaKey, "invoice_code"),
+      lineNo:   this._getColIndex(stgSchemaKey, "line_no"),
+      itemCode: this._getColIndex(stgSchemaKey, "item_code"),
+      unit:     this._getColIndex(stgSchemaKey, "unit"),
+      qty:      this._getColIndex(stgSchemaKey, "quantity"),
+      price:    this._getColIndex(stgSchemaKey, "price"),
+      amount:   this._getColIndex(stgSchemaKey, "amount"),
+      taxAmt:   this._getColIndex(stgSchemaKey, "tax_amount")
+    };
+
+    const parseNum = (val) => {
+      if (typeof val === 'number') return isNaN(val) ? 0 : val;
+      if (!val) return 0;
+      const num = Number(String(val).replace(/,/g, '').trim());
+      return isNaN(num) ? 0 : num;
+    };
+
+    // Nạp định nghĩa Cột của FACT_INBOUND từ Schema
     const schemaMap = this.schemaService.getSchemaMap();
-    const colIndex1Based = this.schemaService.getColIndex(schemaMap, tableName, colKey);
+    const factSchema = schemaMap[factSchemaKey] || schemaMap[factSchemaKey.toLowerCase()];
+    const colDefs = factSchema ? (factSchema.columns || factSchema) : {};
 
-    if (colIndex1Based !== undefined && colIndex1Based !== null && !isNaN(colIndex1Based)) {
-      const numIdx = Number(colIndex1Based);
-      return numIdx >= 1 ? numIdx - 1 : -1;
-    }
-    return -1;
-  }
+    const factRows = [];
 
-  /**
-   * Chuẩn hóa chuỗi period về dạng thuần số để so sánh/lọc (VD: "2026-09" -> "202609")
-   */
-  _normalizePeriod(p) {
-    if (p === null || p === undefined) return "";
-    return String(p).replace(/[-_\s]/g, "").trim();
-  }
-
-  /**
-   * Helper format hoặc ép kiểu ngày chứng từ về dạng Date hoặc String an toàn cho GSheet
-   */
-  _formatDateValue(rawDate) {
-    if (!rawDate) return "";
-    if (rawDate instanceof Date) return rawDate;
-    const d = new Date(rawDate);
-    return isNaN(d.getTime()) ? String(rawDate) : d;
-  }
-
-  /**
-   * 1. Tổng hợp FACT_INBOUND từ STG_PO_INVOICE (Tuân thủ quy ước UPSERT)
-   */
-  processFactInbound(targetPeriod = null) {
-    const targetPeriodNorm = this._normalizePeriod(targetPeriod);
-    Logger.log(`[FACT INBOUND] Bắt đầu tổng hợp Fact Inbound (Kỳ lọc: ${targetPeriodNorm || "ALL"})...`);
-
-    const stgInfo = this.tableRepo.getDataByTableName("STG_PO_INVOICE");
-    const stgRows = stgInfo ? stgInfo.values : [];
-    if (!stgRows || stgRows.length <= 1) return 0;
-
-    const stgPeriodIdx   = this._getColIndex("STG_PO_INVOICE", "period");
-    const stgDateIdx     = this._getColIndex("STG_PO_INVOICE", "invoice_date");
-    const stgCodeIdx     = this._getColIndex("STG_PO_INVOICE", "invoice_code");
-    const stgLineIdx     = this._getColIndex("STG_PO_INVOICE", "line_no");
-    const stgItemCodeIdx = this._getColIndex("STG_PO_INVOICE", "item_code");
-    const stgBaseUnitIdx = this._getColIndex("STG_PO_INVOICE", "base_unit");
-    const stgBaseQtyIdx  = this._getColIndex("STG_PO_INVOICE", "base_qty");
-    const stgBasePrcIdx  = this._getColIndex("STG_PO_INVOICE", "base_price");
-    const stgAmtIdx      = this._getColIndex("STG_PO_INVOICE", "amount");
-    const stgTaxAmtIdx   = this._getColIndex("STG_PO_INVOICE", "tax_amount");
-
-    const validStgRows = [];
+    // 4. Duyệt các dòng Staging
     for (let i = 1; i < stgRows.length; i++) {
       const r = stgRows[i];
-      const rPeriodNorm = this._normalizePeriod(r[stgPeriodIdx]);
 
-      if (targetPeriodNorm && rPeriodNorm !== targetPeriodNorm) continue;
+      const period = idxSTG.period !== -1 ? String(r[idxSTG.period] || "").trim() : "";
+      if (periodFilter && period !== String(periodFilter).trim()) continue;
 
-      const itemCode = String(r[stgItemCodeIdx] || "").trim();
-      if (!itemCode) continue;
+      const invCode = idxSTG.invCode !== -1 ? String(r[idxSTG.invCode] || "").trim() : "";
+      if (!invCode) continue;
 
-      validStgRows.push(r);
-    }
+      const lineNo   = idxSTG.lineNo !== -1 ? String(r[idxSTG.lineNo] || "").trim() : "";
+      const invDate  = idxSTG.invDate !== -1 ? r[idxSTG.invDate] : "";
+      const itemCode = idxSTG.itemCode !== -1 ? String(r[idxSTG.itemCode] || "").trim() : "";
+      const stgUnit  = idxSTG.unit !== -1 ? String(r[idxSTG.unit] || "").trim() : "";
+      
+      const qty    = parseNum(idxSTG.qty !== -1 ? r[idxSTG.qty] : 0);
+      const price  = parseNum(idxSTG.price !== -1 ? r[idxSTG.price] : 0);
+      const amount = parseNum(idxSTG.amount !== -1 ? r[idxSTG.amount] : 0);
+      const taxAmt = parseNum(idxSTG.taxAmt !== -1 ? r[idxSTG.taxAmt] : 0);
 
-    if (validStgRows.length === 0) {
-      Logger.log(`[FACT INBOUND] Không tìm thấy dữ liệu Staging phù hợp cho kỳ [${targetPeriodNorm || "ALL"}].`);
-      return 0;
-    }
+      // Tra cứu Nguyên liệu gốc & Hệ số
+      const imInfo  = imDict[itemCode] || {};
+      const ingCode = imInfo.ingredientCode || itemCode;
 
-    // Mapping item_code -> ingredient_code từ ITEM_MASTER
-    const imInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
-    const imRows = imInfo ? imInfo.values : [];
-    const itemIngrMap = {};
+      const { factor, baseUnit } = this._resolveConversionFactorAndBaseUnit("INT", itemCode, stgUnit, ucDict, imDict);
 
-    if (imRows && imRows.length > 1) {
-      const codeIdx = this._getColIndex("ITEM_MASTER", "item_code");
-      const ingrIdx = this._getColIndex("ITEM_MASTER", "ingredient_code");
-      for (let i = 1; i < imRows.length; i++) {
-        const c = String(imRows[i][codeIdx] || "").trim();
-        const ing = String(imRows[i][ingrIdx] || "").trim();
-        if (c) itemIngrMap[c] = ing || c;
-      }
-    }
+      const baseQty     = qty * factor;
+      const basePrice   = factor !== 0 ? price / factor : price;
+      const totalAmount = amount + taxAmt;
 
-    const factInboundRows = [];
+      // Map dữ liệu theo đúng col_key của Schema FACT_INBOUND
+      const computedFactObj = {
+        "period":          period,
+        "trans_date":      invDate,
+        "doc_code":        invCode,
+        "line_no":         lineNo,
+        "item_code":       itemCode,
+        "ingredient_code": ingCode,
+        "base_unit":       baseUnit,
+        "base_qty":        baseQty,
+        "base_price":      basePrice,
+        "amount":          amount,
+        "tax_amount":      taxAmt,
+        "total_amount":    totalAmount
+      };
 
-    for (let i = 0; i < validStgRows.length; i++) {
-      const r = validStgRows[i];
-      const rPeriod   = String(r[stgPeriodIdx] || "").trim();
-      const itemCode  = String(r[stgItemCodeIdx] || "").trim();
-      const baseQty   = Number(r[stgBaseQtyIdx]) || 0;
-      const basePrice = Number(r[stgBasePrcIdx]) || 0;
-      const amount    = Number(r[stgAmtIdx]) || (baseQty * basePrice);
-      const taxAmt    = Number(r[stgTaxAmtIdx]) || 0;
-      const invDate   = this._formatDateValue(r[stgDateIdx]);
+      // 5. Dynamic Projection: Dựng mảng kết quả ĐỘNG hoàn toàn theo col_index trong Schema
+      const projectedRow = [];
+      Object.keys(colDefs).forEach(colKey => {
+        const colInfo = colDefs[colKey];
+        const idxZeroBased = (typeof colInfo === 'object' && colInfo.col_index !== undefined)
+          ? Number(colInfo.col_index) - 1
+          : Number(colInfo) - 1;
 
-      const row = [
-        rPeriod,
-        invDate,
-        r[stgCodeIdx],
-        r[stgLineIdx],
-        itemCode,
-        itemIngrMap[itemCode] || itemCode,
-        r[stgBaseUnitIdx],
-        baseQty,
-        basePrice,
-        amount,
-        taxAmt,
-        amount + taxAmt
-      ];
-
-      factInboundRows.push(row);
-    }
-
-    if (factInboundRows.length > 0) {
-      // Thực thi UPSERT theo khóa chính kết hợp ["doc_code", "line_no", "item_code"]
-      this.tableRepo.upsertRowsByTableName("FACT_INBOUND", factInboundRows, ["doc_code", "line_no", "item_code"]);
-      Logger.log(`[FACT INBOUND] Thực thi UPSERT hoàn tất cho ${factInboundRows.length} dòng Fact Inbound.`);
-    }
-
-    return factInboundRows.length;
-  }
-
-  /**
-   * 2. Tổng hợp FACT_OUTBOUND từ STG_SO_INVOICE (Tuân thủ quy ước UPSERT)
-   */
-  processFactOutbound(targetPeriod = null) {
-    const targetPeriodNorm = this._normalizePeriod(targetPeriod);
-    Logger.log(`[FACT OUTBOUND] Bắt đầu tổng hợp Fact Outbound (Kỳ lọc: ${targetPeriodNorm || "ALL"})...`);
-
-    const stgInfo = this.tableRepo.getDataByTableName("STG_SO_INVOICE");
-    const stgRows = stgInfo ? stgInfo.values : [];
-    if (!stgRows || stgRows.length <= 1) return 0;
-
-    const stgPeriodIdx   = this._getColIndex("STG_SO_INVOICE", "period");
-    const stgDateIdx     = this._getColIndex("STG_SO_INVOICE", "invoice_date");
-    const stgCodeIdx     = this._getColIndex("STG_SO_INVOICE", "invoice_code");
-    const stgLineIdx     = this._getColIndex("STG_SO_INVOICE", "line_no");
-    const stgItemCodeIdx = this._getColIndex("STG_SO_INVOICE", "item_code");
-    const stgQtyIdx      = this._getColIndex("STG_SO_INVOICE", "quantity");
-
-    const validStgRows = [];
-    for (let i = 1; i < stgRows.length; i++) {
-      const r = stgRows[i];
-      const rPeriodNorm = this._normalizePeriod(r[stgPeriodIdx]);
-      const parentCode  = String(r[stgItemCodeIdx] || "").trim();
-      const soldQty     = Number(r[stgQtyIdx]) || 0;
-
-      if (targetPeriodNorm && rPeriodNorm !== targetPeriodNorm) continue;
-      if (!parentCode || soldQty <= 0) continue;
-
-      validStgRows.push(r);
-    }
-
-    if (validStgRows.length === 0) return 0;
-
-    const avgCostMap = this._buildAvgUnitCostMap();
-    const allocationRulesMap = this._loadAllocationRules();
-
-    const imInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
-    const imRows = imInfo ? imInfo.values : [];
-    const itemToIngrMap = {};
-
-    if (imRows && imRows.length > 1) {
-      const codeIdx = this._getColIndex("ITEM_MASTER", "item_code");
-      const ingrIdx = this._getColIndex("ITEM_MASTER", "ingredient_code");
-      for (let i = 1; i < imRows.length; i++) {
-        const c = String(imRows[i][codeIdx] || "").trim();
-        const ing = String(imRows[i][ingrIdx] || "").trim();
-        if (c) itemToIngrMap[c] = ing;
-      }
-    }
-
-    const factOutboundRows = [];
-
-    for (let i = 0; i < validStgRows.length; i++) {
-      const r = validStgRows[i];
-      const rPeriod    = String(r[stgPeriodIdx] || "").trim();
-      const parentCode = String(r[stgItemCodeIdx] || "").trim();
-      const soldQty    = Number(r[stgQtyIdx]) || 0;
-      const transDate  = this._formatDateValue(r[stgDateIdx]);
-
-      const overheadRate = this._resolveAllocationRate(transDate, rPeriod, allocationRulesMap);
-
-      let explodedIngredients = [];
-      if (this.bomService && typeof this.bomService.getExplodedRecipe === 'function') {
-        explodedIngredients = this.bomService.getExplodedRecipe(parentCode, transDate);
-      }
-
-      if (explodedIngredients && explodedIngredients.length > 0) {
-        explodedIngredients.forEach((ing, idx) => {
-          const consumedQty  = soldQty * ing.norm_qty;
-          const unitCost     = avgCostMap[ing.ingredient_code] || 0;
-          const rawCost      = consumedQty * unitCost;
-          const overheadCost = rawCost * overheadRate;
-          const totalCost    = rawCost + overheadCost;
-
-          factOutboundRows.push([
-            rPeriod,
-            transDate,
-            r[stgCodeIdx],
-            `${r[stgLineIdx]}_${idx + 1}`,
-            parentCode,
-            ing.ingredient_code,
-            ing.depth || 1,
-            soldQty,
-            ing.norm_qty,
-            ing.base_unit,
-            consumedQty,
-            unitCost,
-            rawCost,
-            overheadRate,
-            overheadCost,
-            totalCost
-          ]);
-        });
-      } else {
-        const targetIngrCode = itemToIngrMap[parentCode] || parentCode;
-        const unitCost     = avgCostMap[targetIngrCode] || 0;
-        const rawCost      = soldQty * unitCost;
-        const overheadCost = rawCost * overheadRate;
-        const totalCost    = rawCost + overheadCost;
-
-        factOutboundRows.push([
-          rPeriod,
-          transDate,
-          r[stgCodeIdx],
-          String(r[stgLineIdx]),
-          parentCode,
-          targetIngrCode,
-          0,
-          soldQty,
-          1,
-          "kg",
-          soldQty,
-          unitCost,
-          rawCost,
-          overheadRate,
-          overheadCost,
-          totalCost
-        ]);
-      }
-    }
-
-    if (factOutboundRows.length > 0) {
-      // Thực thi UPSERT theo khóa chính kết hợp cho Fact Outbound
-      this.tableRepo.upsertRowsByTableName("FACT_OUTBOUND", factOutboundRows, ["doc_code", "line_no", "parent_code", "ingredient_code"]);
-      Logger.log(`[FACT OUTBOUND] Thực thi UPSERT hoàn tất cho ${factOutboundRows.length} dòng Fact Outbound.`);
-    }
-
-    return factOutboundRows.length;
-  }
-
-  /**
-   * Helper: Tính giá vốn bình quân theo mã nguyên liệu từ FACT_INBOUND
-   */
-  _buildAvgUnitCostMap() {
-    const factIn = this.tableRepo.getDataByTableName("FACT_INBOUND");
-    const rows = factIn ? factIn.values : [];
-    const totals = {};
-
-    if (rows && rows.length > 1) {
-      const ingIdx = this._getColIndex("FACT_INBOUND", "ingredient_code");
-      const qtyIdx = this._getColIndex("FACT_INBOUND", "base_qty");
-      const amtIdx = this._getColIndex("FACT_INBOUND", "amount");
-
-      for (let i = 1; i < rows.length; i++) {
-        const ing = String(rows[i][ingIdx] || "").trim();
-        const q   = Number(rows[i][qtyIdx]) || 0;
-        const a   = Number(rows[i][amtIdx]) || 0;
-
-        if (ing && q > 0) {
-          if (!totals[ing]) totals[ing] = { qty: 0, amt: 0 };
-          totals[ing].qty += q;
-          totals[ing].amt += a;
+        if (idxZeroBased >= 0) {
+          const val = computedFactObj.hasOwnProperty(colKey) ? computedFactObj[colKey] : "";
+          projectedRow[idxZeroBased] = (val !== undefined && val !== null) ? val : "";
         }
-      }
+      });
+
+      factRows.push(projectedRow);
     }
 
-    const avgMap = {};
-    Object.keys(totals).forEach(ing => {
-      avgMap[ing] = totals[ing].qty > 0 ? totals[ing].amt / totals[ing].qty : 0;
-    });
+    // 6. Lưu xuống bảng FACT_INBOUND via DAL Repository
+    if (factRows.length > 0) {
+      this.tableRepo.upsertRowsByTableName(factSchemaKey, factRows, primaryKeys);
+      Logger.log(`[FACT INBOUND] Đã xử lý & ghi thành công ${factRows.length} dòng vào FACT_INBOUND.`);
+    }
 
-    return avgMap;
+    return factRows.length;
   }
 
   /**
-   * Helper: Tải danh sách quy tắc phân bổ chi phí chung theo Schema ALLOCATION_RULE
+   * Tính lại Fact khi thông số UNIT_CONVERSION thay đổi
    */
-  _loadAllocationRules() {
-    const rulesTable = this.tableRepo.getDataByTableName("ALLOCATION_RULE");
-    const rows = rulesTable ? rulesTable.values : [];
-    const list = [];
+  recalculateFactOnUnitConversionChange(sourceGroup = "ALL") {
+    const isAll = String(sourceGroup || "").trim().toUpperCase() === "ALL";
+    let total = 0;
 
-    if (rows && rows.length > 1) {
-      const rateIdx = this._getColIndex("ALLOCATION_RULE", "allocation_rate");
-      const fromIdx = this._getColIndex("ALLOCATION_RULE", "effective_from");
-      const toIdx   = this._getColIndex("ALLOCATION_RULE", "effective_to");
-      const actIdx  = this._getColIndex("ALLOCATION_RULE", "is_active");
-
-      for (let i = 1; i < rows.length; i++) {
-        const isActive = rows[i][actIdx] === true || String(rows[i][actIdx]).toUpperCase() === "TRUE";
-        if (isActive) {
-          list.push({
-            rate: Number(rows[i][rateIdx]) || 0,
-            effectiveFrom: rows[i][fromIdx] ? new Date(rows[i][fromIdx]) : new Date("1900-01-01"),
-            effectiveTo: rows[i][toIdx] ? new Date(rows[i][toIdx]) : new Date("2099-12-31")
-          });
-        }
-      }
+    if (isAll || sourceGroup === "PO" || sourceGroup === "INT") {
+      total += this.processFactInbound();
     }
-    return list;
+    return total;
   }
 
   /**
-   * Helper: Tìm tỷ lệ phân bổ chi phí chung phù hợp với ngày chứng từ
+   * Placeholder cho Fact Outbound (Sẽ mở rộng khi xử lý STG_SALES/POS)
    */
-  _resolveAllocationRate(transDate, period, rules) {
-    if (!rules || rules.length === 0) return 0;
-
-    const targetDate = transDate ? new Date(transDate) : new Date();
-    targetDate.setHours(0, 0, 0, 0);
-
-    const matchedRule = rules.find(r => {
-      const f = new Date(r.effectiveFrom); f.setHours(0, 0, 0, 0);
-      const t = new Date(r.effectiveTo); t.setHours(0, 0, 0, 0);
-      return targetDate >= f && targetDate <= t;
-    });
-
-    return matchedRule ? matchedRule.rate : 0;
+  processFactOutbound(periodFilter = null) {
+    Logger.log("[FACT OUTBOUND] Chưa triển khai.");
+    return 0;
   }
 }

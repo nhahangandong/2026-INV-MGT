@@ -58,14 +58,44 @@ class SchemaService {
     throw new Error(`Không tìm thấy schema_name: ${normalizedName} trong cấu hình SCHEMA.`);
   }
 
+  // /**
+  //  * Lấy chỉ số cột (col_index bắt đầu từ 1) dựa trên schema_name và col_key
+  //  * @param {Object} schemaMap - Bản đồ cấu trúc schema
+  //  * @param {string} schemaName - Tên lược đồ
+  //  * @param {string} colKey - Khóa cột cần tra cứu
+  //  * @return {number} Chỉ số cột (từ 1) hoặc -1 nếu không tìm thấy
+  //  */
+  // getColIndex(schemaMap, schemaName, colKey) {
+  //   if (!schemaName || !colKey) return -1;
+  //   const normalizedName = String(schemaName).trim().toUpperCase();
+    
+  //   if (schemaMap && schemaMap[normalizedName] && schemaMap[normalizedName].columns) {
+  //     const index = schemaMap[normalizedName].columns[colKey];
+  //     return index !== undefined ? index : -1;
+  //   }
+  //   return -1;
+  // }
+
+
   /**
    * Lấy chỉ số cột (col_index bắt đầu từ 1) dựa trên schema_name và col_key
-   * @param {Object} schemaMap - Bản đồ cấu trúc schema
-   * @param {string} schemaName - Tên lược đồ
-   * @param {string} colKey - Khóa cột cần tra cứu
-   * @return {number} Chỉ số cột (từ 1) hoặc -1 nếu không tìm thấy
+   * Hỗ trợ linh hoạt cả 2 cách gọi:
+   * 1. getColIndex(schemaMap, schemaName, colKey)
+   * 2. getColIndex(schemaName, colKey)
    */
-  getColIndex(schemaMap, schemaName, colKey) {
+  getColIndex(arg1, arg2, arg3) {
+    let schemaMap, schemaName, colKey;
+
+    if (arg3 !== undefined) {
+      schemaMap = arg1;
+      schemaName = arg2;
+      colKey = arg3;
+    } else {
+      schemaMap = this.getSchemaMap();
+      schemaName = arg1;
+      colKey = arg2;
+    }
+
     if (!schemaName || !colKey) return -1;
     const normalizedName = String(schemaName).trim().toUpperCase();
     
@@ -75,6 +105,9 @@ class SchemaService {
     }
     return -1;
   }
+
+
+  
 }
 
 /**

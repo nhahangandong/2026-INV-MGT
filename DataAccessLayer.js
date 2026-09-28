@@ -78,89 +78,111 @@ class TableRepository {
     }
 
     const currentValues = tableInfo.values;
-    // Vị trí dòng tiếp theo để ghi là: dòng bắt đầu của bảng + tổng số dòng hiện có trong bảng
+    // Vị trí dòng tiếp theo để ghi
     const nextRow = tableInfo.startRow + currentValues.length;
     const numCols = rows[0].length;
 
-    // Ghi hàng loạt bằng setValues giúp tối ưu tốc độ và không giới hạn như appendRow
     sheet.getRange(nextRow, tableInfo.startCol, rows.length, numCols).setValues(rows);
   }
 
   /**
-   * Thực thi UPSERT dữ liệu hàng loạt dựa trên col_key xác định (chuẩn V2 Schema-Driven)
+   * Ghi đè toàn bộ dữ liệu trở lại Google Sheets Table (An toàn với bảng Rỗng)
+   */
+  updateTableData(schemaName, fullDataArray) {
+    if (!fullDataArray || fullDataArray.length === 0) return;
+
+    const tableInfo = this.getDataByTableName(schemaName);
+    const sheet = this.ss.getSheetByName(tableInfo.sheetName);
+
+    if (!sheet) {
+      throw new Error(`[DAL] Không tìm thấy sheet cho bảng '${schemaName}'`);
+    }
+
+    const numRows = fullDataArray.length;
+    const numCols = fullDataArray[0].length; // Lấy chính xác số cột của mảng DỮ LIỆU THỰC TẾ
+
+    // Xóa bớt/Cập nhật Range ghi đè đúng kích thước mảng data
+    sheet.getRange(tableInfo.startRow, tableInfo.startCol, numRows, numCols).setValues(fullDataArray);
+  }
+
+  /**
+   * NÂNG CẤP: Thực thi UPSERT dữ liệu hàng loạt dựa trên khóa chính
+   * - Nếu Khóa chính ĐÃ TỒN TẠI: Cập nhật (Overwrite) các cột mới vào dòng cũ.
+   * - Nếu Khóa chính CHƯA TỒN TẠI: Thêm mới (Insert/Append) dòng dữ liệu.
+   */
+  /**
+   * NÂNG CẤP CHUẨN INDEX: Thực thi UPSERT dữ liệu hàng loạt dựa trên khóa chính
    */
   upsertRowsByTableName(schemaName, newRows, uniqueKeyCols) {
     if (!newRows || newRows.length === 0) return;
 
     const tableInfo = this.getDataByTableName(schemaName);
-    const data = tableInfo.values;
+    const fullValues = tableInfo.values;
 
-    // Chuẩn hóa danh sách khóa chính thành mảng
+    if (!fullValues || fullValues.length === 0) return;
+
+    // Tách dòng Header (dòng 0) và phần Dữ liệu thực tế (từ dòng 1 trở đi)
+    const headerRow = fullValues[0];
+    const existingData = fullValues.slice(1);
+
+    // Chuẩn hóa danh sách khóa chính
     const keyColsArray = Array.isArray(uniqueKeyCols) ? uniqueKeyCols : [uniqueKeyCols];
 
-    // Lấy chính xác vị trí mảng (0-based index) hoàn toàn dựa vào col_index từ Schema
+    // Lấy chỉ mục mảng (0-based index) từ Schema
     const keyColIndices = keyColsArray.map(colKey => {
       const colIndex = schemaGetColIndex(this.schemaMap, schemaName, colKey);
       if (!colIndex || colIndex <= 0) {
         throw new Error(`[V2 Architecture] Không tìm thấy col_index hợp lệ cho col_key '${colKey}' trong schema '${schemaName}'`);
       }
-      return colIndex - 1; // Chuyển col_index (1-based) sang mảng 0-based
+      return colIndex - 1;
     });
 
-    // Hàm tạo chuỗi khóa tổ hợp duy nhất, ép kiểu string và trim để khớp tuyệt đối
+    // Tạo chuỗi khóa composite
     const makeRowKey = (row) => {
       return keyColIndices.map(colIdx => {
         const val = row[colIdx];
         return (val !== undefined && val !== null && val !== "") ? String(val).trim() : "";
-      }).join("___"); // Sử dụng phân tách đặc biệt để tránh nhập nhằng chuỗi
+      }).join("___");
     };
 
-    // Đưa các khóa đã tồn tại trong Hub vào Set để tra cứu O(1)
-    const existingKeys = new Set();
-    for (let i = 0; i < data.length; i++) { // Bắt đầu từ 0 nếu data không chứa header hoặc 1 nếu có header
-      const rowKey = makeRowKey(data[i]);
-      // Kiểm tra khóa không được rỗng ở tất cả các thành phần
-      if (rowKey && rowKey.split("___").every(part => part !== "")) { 
-        existingKeys.add(rowKey);
+    // Ánh xạ chuỗi Khóa chính -> Chỉ số dòng trong mảng existingData (0-based)
+    const existingRowIndexMap = new Map();
+    for (let i = 0; i < existingData.length; i++) {
+      const rowKey = makeRowKey(existingData[i]);
+      if (rowKey && rowKey.split("___").every(part => part !== "")) {
+        existingRowIndexMap.set(rowKey, i);
       }
     }
 
-    const rowsToAppend = [];
-    newRows.forEach(row => {
-      const rowKey = makeRowKey(row);
-      // Kiểm tra xem dòng này đã tồn tại trong Hub hay chưa, đồng thời tránh trùng lặp trong chính đợt đẩy này
-      if (rowKey && !existingKeys.has(rowKey)) {
-        rowsToAppend.push(row);
-        existingKeys.add(rowKey); 
+    let updatedCount = 0;
+    let insertedCount = 0;
+
+    // Duyệt qua dữ liệu mới để Update hoặc Insert
+    newRows.forEach(newRow => {
+      const rowKey = makeRowKey(newRow);
+      if (!rowKey) return;
+
+      if (existingRowIndexMap.has(rowKey)) {
+        // [UPDATE] Khớp khóa -> Thay thế đúng dòng dữ liệu trong existingData
+        const targetIdx = existingRowIndexMap.get(rowKey);
+        existingData[targetIdx] = newRow;
+        updatedCount++;
+      } else {
+        // [INSERT] Chưa có khóa -> Thêm vào cuối mảng existingData
+        existingData.push(newRow);
+        existingRowIndexMap.set(rowKey, existingData.length - 1);
+        insertedCount++;
       }
     });
 
-    // Thực hiện ghi bổ sung dữ liệu mới
-    if (rowsToAppend.length > 0) {
-      this.appendRowsByTableName(schemaName, rowsToAppend);
-      Logger.log(`[DEBUG] Upsert thành công ${rowsToAppend.length} dòng mới vào schema '${schemaName}'.`);
+    // Ráp lại Header và Dữ liệu đã cập nhật trước khi ghi đè
+    const finalTableData = [headerRow, ...existingData];
+
+    if (updatedCount > 0 || insertedCount > 0) {
+      this.updateTableData(schemaName, finalTableData);
+      Logger.log(`[TableRepository] Upsert [${schemaName}] thành công: Cập nhật ${updatedCount} dòng, Thêm mới ${insertedCount} dòng.`);
     } else {
-      Logger.log(`[DEBUG] Không có dòng dữ liệu mới nào cần thêm vào schema '${schemaName}' (tất cả đã tồn tại).`);
+      Logger.log(`[TableRepository] [${schemaName}] Không có sự thay đổi dữ liệu.`);
     }
   }
-  
-  /**
-   * Ghi đè toàn bộ dữ liệu (đã qua xử lý) trở lại Google Sheets Table
-   * Rất hữu ích cho các tác vụ Transform hàng loạt in-memory.
-   */
-  updateTableData(schemaName, fullDataArray) {
-    if (!fullDataArray || fullDataArray.length === 0) return;
-    
-    const tableInfo = this.getDataByTableName(schemaName);
-    const sheet = this.ss.getSheetByName(tableInfo.sheetName);
-    
-    if (!sheet) {
-      throw new Error(`[V2 Architecture] Không tìm thấy sheet vật lý cho bảng: ${tableInfo.tableName}`);
-    }
-
-    // Ghi đè lại toàn bộ mảng dữ liệu vào đúng vùng tọa độ của bảng
-    sheet.getRange(tableInfo.startRow, tableInfo.startCol, fullDataArray.length, fullDataArray[0].length).setValues(fullDataArray);
-  }
-
-  
 }

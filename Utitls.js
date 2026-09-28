@@ -16,7 +16,6 @@ function generateTablesCatalogSheet() {
     "stg_so": "Dữ liệu Staging Bán hàng / SO (dùng tính tiêu hao BOM lý thuyết)",
     "stg_inventory": "Dữ liệu Kiểm kê định kỳ thực tế đầu/cuối kỳ",
     "sys_config": "Cấu hình tham số hệ thống và cài đặt kỹ thuật",
-    "unit_conversion": "Danh mục bảng quy đổi đơn vị tính",
     "TABLES": "Bảng Danh mục tất cả các Tables và Mô tả chức năng trong Hệ thống"
   };
 
