@@ -1,5 +1,5 @@
 /**
- * [SERVICE] DataStagingService - Biến đổi, Làm sạch, Ánh xạ Danh mục Staging & Chuẩn bị Fact
+ * [SERVICE] DataStagingService - Tối ưu hiệu năng I/O & Batch Write
  */
 class DataStagingService {
   constructor(tableRepo, schemaService, sysConfigService) {
@@ -11,13 +11,6 @@ class DataStagingService {
     this.sysConfigService = sysConfigService;
   }
 
-  // ==========================================
-  // HELPER UTILS
-  // ==========================================
-
-  /**
-   * Helper loại bỏ dấu tiếng Việt và ký tự đặc biệt
-   */
   _removeVietnameseTones(str) {
     if (!str) return "";
     return str
@@ -29,42 +22,32 @@ class DataStagingService {
       .trim();
   }
 
-  /**
-   * Helper chuyển đổi chuỗi chứa Wildcard (*) và dấu phẩy (,) thành danh sách các RegExp
-   * Ví dụ: "*bia tươi carlsberg*tháp*" -> /bia tươi carlsberg.*tháp/i
-   */
   _parseWildcardToRegExps(rawKwStr) {
     if (!rawKwStr) return [];
-    
     return String(rawKwStr)
       .split(",")
       .map(pattern => {
         let trimmed = pattern.trim();
         if (!trimmed) return null;
-
-        let escaped = trimmed.replace(/[\-\[\]\/\{\}\(\)\+\?\.\\\^\$\|]/g, "\\$&");
-        escaped = escaped.replace(/\*+/g, ".*");
-
-        try {
-          return new RegExp(escaped, "i");
-        } catch (e) {
-          return null;
-        }
+        let escaped = trimmed.replace(/[\-\[\]\/\{\}\(\)\+\?\.\\\^\$\|]/g, "\\$&").replace(/\*+/g, ".*");
+        try { return new RegExp(escaped, "i"); } catch (e) { return null; }
       })
       .filter(regex => regex !== null);
   }
 
-  /**
-   * Helper lấy index cột an toàn dựa trên Schema (Trả về 0-based index, nếu không thấy trả về -1)
-   */
+  _matchUnit(rawUnit, ruleUnitStr) {
+    if (!ruleUnitStr) return true;
+    if (!rawUnit) return false;
+    const raw = String(rawUnit).trim().toLowerCase();
+    const allowedUnits = String(ruleUnitStr).split(",").map(u => u.trim().toLowerCase()).filter(u => u.length > 0);
+    return allowedUnits.includes(raw);
+  }
+
   _getColIndex(schemaName, colKey) {
     const col1Based = this.schemaService.getColIndex(schemaName, colKey);
     return col1Based > 0 ? col1Based - 1 : -1;
   }
 
-  /**
-   * Dựng Dict thông tin ITEM_MASTER hỗ trợ tra cứu
-   */
   _buildItemMasterDict() {
     const imInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
     const rows = imInfo ? imInfo.values : [];
@@ -78,9 +61,7 @@ class DataStagingService {
         for (let i = 1; i < rows.length; i++) {
           const code = String(rows[i][codeIdx] || "").trim();
           if (code) {
-            dict[code] = {
-              baseUnit: String(rows[i][baseUnitIdx] || "").trim().toLowerCase()
-            };
+            dict[code] = { baseUnit: String(rows[i][baseUnitIdx] || "").trim().toLowerCase() };
           }
         }
       }
@@ -88,87 +69,176 @@ class DataStagingService {
     return dict;
   }
 
-  // ==========================================
-  // STAGING PIPELINE CORE (BUOC 0 - BUOC 3)
-  // ==========================================
-
-  /**
-   * BƯỚC 0: Tự động quét RAW để bootstrap các mặt hàng mới (raw_name) sang MAP_RULE
-   */
-  bootstrapMapRulesFromRaw(sourceGroup) {
-    const srcMeta = this.sysConfigService.getSourceMetadata(sourceGroup);
-    const rawSchemaName = srcMeta.rawSchema;
-    const mapRuleGroup = srcMeta.mapRuleGroup || srcMeta.coreGroup || "INT";
-
+  _detectInvoiceContexts(rawSchemaName, autoRules) {
     const rawDataInfo = this.tableRepo.getDataByTableName(rawSchemaName);
-    const mapRuleInfo = this.tableRepo.getDataByTableName("MAP_RULE");
+    if (!rawDataInfo || !rawDataInfo.values || rawDataInfo.values.length <= 1) return {};
 
-    if (!rawDataInfo || !rawDataInfo.values || rawDataInfo.values.length <= 1) return 0;
-
+    const idxInvCode = this._getColIndex(rawSchemaName, "invoice_code");
     const idxRawName = this._getColIndex(rawSchemaName, "raw_name");
-    if (idxRawName === -1) return 0;
+    const idxUnit    = this._getColIndex(rawSchemaName, "unit");
 
-    const idxMR = {
-      sourceGrp: this._getColIndex("MAP_RULE", "source_grp"),
-      rawName:   this._getColIndex("MAP_RULE", "raw_name")
-    };
+    if (idxInvCode === -1) return {};
 
-    const existingKeys = new Set();
-    const mapRows = mapRuleInfo && mapRuleInfo.values ? mapRuleInfo.values.slice(1) : [];
-    mapRows.forEach(r => {
-      const grp = String(r[idxMR.sourceGrp] || "").trim().toUpperCase();
-      const raw = String(r[idxMR.rawName] || "").trim().toLowerCase();
-      if (grp && raw) existingKeys.add(`${grp}|${raw}`);
-    });
-
-    const schemaMap = this.schemaService.getSchemaMap();
-    const mrColsConfig = schemaMap["MAP_RULE"] ? schemaMap["MAP_RULE"].columns : {};
-    const totalCols = Math.max(...Object.values(mrColsConfig), 4);
-
-    const idxMRFull = {
-      sourceGrp: this._getColIndex("MAP_RULE", "source_grp"),
-      rawName:   this._getColIndex("MAP_RULE", "raw_name"),
-      itemName:  this._getColIndex("MAP_RULE", "item_name"),
-      itemCode:  this._getColIndex("MAP_RULE", "item_code")
-    };
+    const contextMap = {};
+    const anchorRules = autoRules.filter(r => r.isAnchor);
+    const vendorRules = autoRules.filter(r => r.vendorTaxCode);
 
     const rawRows = rawDataInfo.values.slice(1);
-    const newMapRuleRows = [];
-
     rawRows.forEach(row => {
-      const rawName = String(row[idxRawName] || "").trim();
-      if (!rawName) return;
+      const invCode = String(row[idxInvCode] || "").trim();
+      if (!invCode) return;
 
-      const key = `${mapRuleGroup.toUpperCase()}|${rawName.toLowerCase()}`;
-      if (!existingKeys.has(key)) {
-        existingKeys.add(key);
-        
-        const newRow = new Array(totalCols).fill("");
-        if (idxMRFull.sourceGrp !== -1) newRow[idxMRFull.sourceGrp] = mapRuleGroup.toUpperCase();
-        if (idxMRFull.rawName !== -1)   newRow[idxMRFull.rawName]   = rawName;
-        if (idxMRFull.itemName !== -1)  newRow[idxMRFull.itemName]  = "";
-        if (idxMRFull.itemCode !== -1)  newRow[idxMRFull.itemCode]  = "";
+      const hasVendorMatch = vendorRules.some(r => r.vendorTaxCode && invCode.includes(r.vendorTaxCode));
+      if (hasVendorMatch) {
+        contextMap[invCode] = "EXPENSE";
+        return;
+      }
 
-        newMapRuleRows.push(newRow);
+      if (contextMap[invCode] !== "EXPENSE") {
+        const rawName = idxRawName !== -1 ? String(row[idxRawName] || "").trim() : "";
+        const unit    = idxUnit !== -1    ? String(row[idxUnit] || "").trim() : "";
+
+        const isAnchorMatched = anchorRules.some(r => {
+          const matchName = r.regExps.length > 0 && r.regExps.some(rx => rx.test(rawName));
+          const matchUnit = this._matchUnit(unit, r.rawUnit);
+          return matchName && matchUnit;
+        });
+
+        if (isAnchorMatched) contextMap[invCode] = "EXPENSE";
       }
     });
 
-    if (newMapRuleRows.length > 0) {
-      this.tableRepo.upsertRowsByTableName("MAP_RULE", newMapRuleRows, ["source_grp", "raw_name"]);
-      Logger.log(`[BOOTSTRAP MAP_RULE] Đã bổ sung ${newMapRuleRows.length} mặt hàng mới vào MAP_RULE.`);
-    }
-
-    return newMapRuleRows.length;
+    return contextMap;
   }
 
-  /**
-   * BƯỚC 1: Áp dụng AUTO_MAP_RULE để gợi ý tên chuẩn (item_name) vào MAP_RULE
-   */
+  /** Ham bootstrap du lieu cho unit_conversion */
+  bootstrapUnitConversionFromStaging() {
+    const imDict = this._buildItemMasterDict();
+    
+    // 1. Lấy danh sách item_code hợp lệ (Active Set) từ MAP_RULE bằng schema_name
+    const mapRuleInfo = this.tableRepo.getDataByTableName("MAP_RULE");
+    const activeItemCodes = new Set();
+    if (mapRuleInfo && mapRuleInfo.values && mapRuleInfo.values.length > 1) {
+      const idxMRCode = this._getColIndex("MAP_RULE", "item_code");
+      if (idxMRCode !== -1) {
+        mapRuleInfo.values.slice(1).forEach(r => {
+          const code = String(r[idxMRCode] || "").trim();
+          if (code) activeItemCodes.add(code);
+        });
+      }
+    }
+
+    const ucInfo = this.tableRepo.getDataByTableName("UNIT_CONVERSION");
+    if (!ucInfo || !ucInfo.values || ucInfo.values.length === 0) return 0;
+
+    const headers = ucInfo.values[0];
+    const grpIdx    = this._getColIndex("UNIT_CONVERSION", "source_grp");
+    const codeIdx   = this._getColIndex("UNIT_CONVERSION", "item_code");
+    const altIdx    = this._getColIndex("UNIT_CONVERSION", "alt_unit");
+    const rawKwIdx  = this._getColIndex("UNIT_CONVERSION", "raw_keyword");
+    const baseIdx   = this._getColIndex("UNIT_CONVERSION", "base_unit");
+    const factorIdx = this._getColIndex("UNIT_CONVERSION", "conversion_factor");
+    const statusIdx = this._getColIndex("UNIT_CONVERSION", "status");
+
+    if (grpIdx === -1 || codeIdx === -1 || altIdx === -1) return 0;
+
+    const totalCols = headers.length;
+    const existingMap = new Map();
+    const allDataRows = [];
+
+    // 2. Duyệt qua TẤT CẢ các dòng hiện tại của UNIT_CONVERSION và ĐÁNH LẠI STATUS
+    for (let i = 1; i < ucInfo.values.length; i++) {
+      const row = [...ucInfo.values[i]];
+      while (row.length < totalCols) row.push("");
+
+      const g = String(row[grpIdx] || "INT").trim().toUpperCase();
+      const c = String(row[codeIdx] || "").trim();
+      const u = String(row[altIdx] || "").trim().toLowerCase();
+
+      if (c) {
+        // Đối chiếu với MAP_RULE để cập nhật status chuẩn xác
+        if (statusIdx !== -1) {
+          row[statusIdx] = activeItemCodes.has(c) ? "ACTIVE" : "NEED_REVIEW";
+        }
+        if (u) {
+          existingMap.set(`${g}___${c}___${u}`, row);
+        }
+      }
+      allDataRows.push(row);
+    }
+
+    // 3. Quét các bảng Staging (dùng chuẩn schema_name viết hoa)
+    const stgTables = [
+      { name: "STG_PO_INVOICE", grp: "INT" },
+      { name: "STG_SO_INVOICE", grp: "OUT" },
+      { name: "STG_INVENTORY_OPENING", grp: "INT" }
+    ];
+
+    stgTables.forEach(t => {
+      const stgInfo = this.tableRepo.getDataByTableName(t.name);
+      const rows = stgInfo ? stgInfo.values : [];
+      if (!rows || rows.length <= 1) return;
+
+      const codeStgIdx = this._getColIndex(t.name, "item_code");
+      const unitStgIdx = this._getColIndex(t.name, "unit");
+
+      if (codeStgIdx === -1 || unitStgIdx === -1) return;
+
+      for (let i = 1; i < rows.length; i++) {
+        const itemCode = String(rows[i][codeStgIdx] || "").trim();
+        const stgUnit  = String(rows[i][unitStgIdx] || "").trim().toLowerCase();
+        if (!itemCode || !stgUnit) continue;
+
+        const imData   = imDict[itemCode] || {};
+        const newBaseUnit = String(imData.baseUnit || "").trim().toLowerCase();
+
+        if (newBaseUnit && stgUnit !== newBaseUnit) {
+          const key = `${t.grp}___${itemCode}___${stgUnit}`;
+
+          if (!existingMap.has(key)) {
+            const newRow = new Array(totalCols).fill("");
+            newRow[grpIdx] = t.grp;
+            newRow[codeIdx] = itemCode;
+            newRow[altIdx] = stgUnit;
+            if (rawKwIdx !== -1)  newRow[rawKwIdx] = stgUnit;
+            if (baseIdx !== -1)   newRow[baseIdx] = newBaseUnit;
+            if (factorIdx !== -1) newRow[factorIdx] = 1;
+            if (statusIdx !== -1) {
+              newRow[statusIdx] = activeItemCodes.has(itemCode) ? "ACTIVE" : "NEED_REVIEW";
+            }
+
+            existingMap.set(key, newRow);
+            allDataRows.push(newRow);
+          }
+        }
+      }
+    });
+
+    // 4. Ghi toàn bộ dữ liệu trở lại bảng UNIT_CONVERSION thông qua schema_name
+    const finalValues = [headers, ...allDataRows];
+    this.tableRepo.writeTableByName("UNIT_CONVERSION", finalValues);
+
+    return allDataRows.length;
+  }
+
+  // Ham ap dung quy tac auto map rule
   applyAutoMapNamesToMapRules(sourceGroup, overwriteExisting = true) {
     this.bootstrapMapRulesFromRaw(sourceGroup);
 
-    const srcMeta = this.sysConfigService.getSourceMetadata(sourceGroup);
+    const srcMeta = this.sysConfigService.getSourceMetadata(sourceGroup) || {};
     const targetGrp = (srcMeta.mapRuleGroup || srcMeta.coreGroup || sourceGroup).toUpperCase();
+    const rawSchemaName = srcMeta.rawSchema;
+
+    const rawIsInventory = (srcMeta.mapping && srcMeta.mapping.isInventory !== undefined)
+      ? srcMeta.mapping.isInventory
+      : srcMeta.isInventory;
+      
+    const isPureInventorySource = Boolean(rawIsInventory === true || String(rawIsInventory).toLowerCase() === "true");
+
+    const rawNonInvConfig = this.sysConfigService.getConfig("NON_INVENTORY_ITEM_TYPES") || ["Chi phí", "Expense"];
+    const nonInventoryItemTypes = (Array.isArray(rawNonInvConfig) ? rawNonInvConfig : String(rawNonInvConfig).split(","))
+      .map(t => String(t).trim().toLowerCase())
+      .filter(t => t.length > 0);
 
     const mapRuleInfo = this.tableRepo.getDataByTableName("MAP_RULE");
     const autoMapInfo = this.tableRepo.getDataByTableName("AUTO_MAP_RULE");
@@ -185,72 +255,137 @@ class DataStagingService {
     let kwIdx = this._getColIndex("AUTO_MAP_RULE", "keywords");
     if (kwIdx === -1) kwIdx = this._getColIndex("AUTO_MAP_RULE", "keyword");
 
-    // Hỗ trợ đọc priority (fallback đọc periority nếu typo)
     let prioIdx = this._getColIndex("AUTO_MAP_RULE", "priority");
     if (prioIdx === -1) prioIdx = this._getColIndex("AUTO_MAP_RULE", "periority");
 
     const idxAM = {
-      sourceGrp: this._getColIndex("AUTO_MAP_RULE", "source_grp"),
-      keyword:   kwIdx,
-      itemName:  this._getColIndex("AUTO_MAP_RULE", "target_item_name"),
-      priority:  prioIdx
+      sourceGrp:     this._getColIndex("AUTO_MAP_RULE", "source_grp"),
+      vendorTaxCode: this._getColIndex("AUTO_MAP_RULE", "vendor_tax_code"),
+      keyword:       kwIdx,
+      rawUnit:       this._getColIndex("AUTO_MAP_RULE", "raw_unit"),
+      itemName:      this._getColIndex("AUTO_MAP_RULE", "target_item_name"),
+      priority:      prioIdx,
+      isAnchor:      this._getColIndex("AUTO_MAP_RULE", "is_anchor")
     };
 
     const autoRules = autoMapInfo.values.slice(1)
       .map(r => ({
-        sourceGrp: idxAM.sourceGrp !== -1 ? String(r[idxAM.sourceGrp] || "").trim().toUpperCase() : "",
-        regExps:   idxAM.keyword !== -1   ? this._parseWildcardToRegExps(String(r[idxAM.keyword] || "")) : [],
-        itemName:  idxAM.itemName !== -1  ? String(r[idxAM.itemName] || "").trim() : "",
-        priority:  idxAM.priority !== -1  ? Number(r[idxAM.priority] || 9999) : 9999
+        sourceGrp:     idxAM.sourceGrp !== -1     ? String(r[idxAM.sourceGrp] || "").trim().toUpperCase() : "",
+        vendorTaxCode: idxAM.vendorTaxCode !== -1 ? String(r[idxAM.vendorTaxCode] || "").trim() : "",
+        regExps:       idxAM.keyword !== -1       ? this._parseWildcardToRegExps(String(r[idxAM.keyword] || "")) : [],
+        rawUnit:       idxAM.rawUnit !== -1       ? String(r[idxAM.rawUnit] || "").trim() : "",
+        itemName:      idxAM.itemName !== -1      ? String(r[idxAM.itemName] || "").trim() : "",
+        priority:      idxAM.priority !== -1      ? Number(r[idxAM.priority] || 9999) : 9999,
+        isAnchor:      idxAM.isAnchor !== -1      ? String(r[idxAM.isAnchor] || "").toUpperCase() === "TRUE" : false
       }))
-      .filter(r => r.regExps.length > 0 && r.itemName)
-      // SẮP XẾP PRIORITY TĂNG DẦN: Số nhỏ hơn chạy trước (a.priority - b.priority)
       .sort((a, b) => a.priority - b.priority);
 
+    const invoiceContexts = !isPureInventorySource ? this._detectInvoiceContexts(rawSchemaName, autoRules) : {};
+    const hasInvoiceContext = Object.keys(invoiceContexts).length > 0;
+
+    const rawDataInfo = this.tableRepo.getDataByTableName(rawSchemaName);
+    const expenseRawContextMap = new Map();
+
+    const activeRawNamesInSource = new Set();
+    if (rawDataInfo && rawDataInfo.values && rawDataInfo.values.length > 1) {
+      const idxRawName = this._getColIndex(rawSchemaName, "raw_name");
+      const idxInvCode = this._getColIndex(rawSchemaName, "invoice_code");
+
+      rawDataInfo.values.slice(1).forEach(row => {
+        const rawName = idxRawName !== -1 ? String(row[idxRawName] || "").trim().toLowerCase() : "";
+        if (rawName) activeRawNamesInSource.add(rawName);
+
+        if (hasInvoiceContext && idxInvCode !== -1 && idxRawName !== -1) {
+          const invCode = String(row[idxInvCode] || "").trim();
+          if (invCode && rawName && invoiceContexts[invCode]) {
+            const vendorMatchRule = autoRules.find(r => r.vendorTaxCode && invCode.includes(r.vendorTaxCode));
+            expenseRawContextMap.set(rawName, {
+              isExpense: true,
+              targetItemName: vendorMatchRule ? vendorMatchRule.itemName : null
+            });
+          }
+        }
+      });
+    }
+
     const mapRows = mapRuleInfo.values.slice(1);
+    const modifiedRows = [];
     let updatedCount = 0;
 
     mapRows.forEach(row => {
       const rowSourceGrp = String(row[idxMR.sourceGrp] || "").trim().toUpperCase();
-      if (targetGrp && rowSourceGrp !== targetGrp && rowSourceGrp !== "ALL") return;
+      if (targetGrp && rowSourceGrp !== targetGrp) return;
 
       const rawName = String(row[idxMR.rawName] || "").trim();
+      const rawNameLower = rawName.toLowerCase();
       let currentItemName = String(row[idxMR.itemName] || "").trim();
 
-      const needUpdate = !currentItemName || overwriteExisting;
+      if (activeRawNamesInSource.size > 0 && !activeRawNamesInSource.has(rawNameLower)) {
+        return;
+      }
 
-      if (needUpdate && rawName) {
-        // Quy tắc nào thỏa mãn trước (priority nhỏ nhất) sẽ được chọn ngay
-        const matchedRule = autoRules.find(rule => {
-          const matchGrp = (!rule.sourceGrp || rule.sourceGrp === "ALL" || rule.sourceGrp === rowSourceGrp);
-          if (!matchGrp) return false;
-          return rule.regExps.some(rx => rx.test(rawName));
-        });
+      let changed = false;
 
-        if (matchedRule && currentItemName !== matchedRule.itemName) {
-          row[idxMR.itemName] = matchedRule.itemName;
-          updatedCount++;
+      if (!isPureInventorySource) {
+        const expenseContext = expenseRawContextMap.get(rawNameLower);
+        if (expenseContext && expenseContext.targetItemName) {
+          if (currentItemName !== expenseContext.targetItemName) {
+            row[idxMR.itemName] = expenseContext.targetItemName;
+            updatedCount++;
+            changed = true;
+          }
+          if (changed) modifiedRows.push(row);
+          return;
         }
       }
+
+      if (isPureInventorySource && currentItemName) {
+        return;
+      }
+
+      const matchedRule = autoRules.find(rule => {
+        const matchGrp = (!rule.sourceGrp || rule.sourceGrp === "ALL" || rule.sourceGrp === rowSourceGrp);
+        if (!matchGrp) return false;
+
+        if (isPureInventorySource) {
+          if (rule.vendorTaxCode || rule.isAnchor) return false;
+          const targetLower = String(rule.itemName || "").toLowerCase();
+          if (nonInventoryItemTypes.some(typeKw => targetLower.includes(typeKw))) return false;
+        }
+
+        if (!isPureInventorySource) {
+          if (rule.vendorTaxCode) return false;
+          if (rule.isAnchor && (!hasInvoiceContext || !expenseContext)) return false;
+        }
+
+        return rule.regExps.length > 0 && rule.regExps.some(rx => rx.test(rawName));
+      });
+
+      if (matchedRule) {
+        if (currentItemName !== matchedRule.itemName) {
+          row[idxMR.itemName] = matchedRule.itemName;
+          updatedCount++;
+          changed = true;
+        }
+      } else if (isPureInventorySource && !currentItemName) {
+        row[idxMR.itemName] = rawName;
+        updatedCount++;
+        changed = true;
+      }
+
+      if (changed) modifiedRows.push(row);
     });
 
-    if (updatedCount > 0) {
-      this.tableRepo.upsertRowsByTableName("MAP_RULE", mapRows, ["source_grp", "raw_name"]);
-      Logger.log(`[MAP RULE] Đã tự động gợi ý và cập nhật ${updatedCount} tên chuẩn cho nhóm [${targetGrp}].`);
+    if (modifiedRows.length > 0) {
+      this.tableRepo.upsertRowsByTableName("MAP_RULE", modifiedRows, ["source_grp", "raw_name"]);
     }
 
     return updatedCount;
   }
 
-  /**
-   * BƯỚC 2: Sinh mã item_code tự động từ item_name chuẩn & Sync sang ITEM_MASTER
-   * Tích hợp gán nhãn trạng thái 'NEED_REVIEW' vào cột status cho các mã mồ côi
-   */
   generateAndSyncItemCodes() {
-    Logger.log(`[GEN CODE] Bắt đầu sinh mã item_code từ tên chuẩn...`);
-
     const itemMasterInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
-    const mapRuleInfo     = this.tableRepo.getDataByTableName("MAP_RULE");
+    const mapRuleInfo    = this.tableRepo.getDataByTableName("MAP_RULE");
 
     if (!mapRuleInfo || !mapRuleInfo.values || mapRuleInfo.values.length <= 1) return 0;
 
@@ -262,7 +397,7 @@ class DataStagingService {
       itemCode:  this._getColIndex("ITEM_MASTER", "item_code"),
       sourceGrp: this._getColIndex("ITEM_MASTER", "source_grp"),
       itemName:  this._getColIndex("ITEM_MASTER", "item_name"),
-      status:    this._getColIndex("ITEM_MASTER", "status") // Cột status mới thêm
+      status:    this._getColIndex("ITEM_MASTER", "status")
     };
 
     const idxMR = {
@@ -272,31 +407,35 @@ class DataStagingService {
       itemCode:  this._getColIndex("MAP_RULE", "item_code")
     };
 
-    const existingIMRowsByName = {}; 
+    // 1. Đọc dữ liệu ITEM_MASTER hiện tại làm bộ nhớ đệm
+    const existingIMMap = new Map();
     const itemRows = itemMasterInfo && itemMasterInfo.values ? itemMasterInfo.values.slice(1) : [];
 
     itemRows.forEach(row => {
-      const name = String(row[idxIM.itemName] || "").trim();
-      if (name) {
+      const code = String(row[idxIM.itemCode] || "").trim();
+      if (code) {
         const fullRow = [...row];
         while (fullRow.length < totalIMCols) fullRow.push("");
-        existingIMRowsByName[name.toLowerCase().replace(/\s+/g, " ")] = fullRow;
+        existingIMMap.set(code, fullRow);
       }
     });
 
     const mapRows = mapRuleInfo.values.slice(1);
     const newMasterRowsMap = new Map();
     const activeCodeSet = new Set();
+    const modifiedMapRows = [];
     let generatedCount = 0;
 
-    // 1. Duyệt MAP_RULE sinh mã chuẩn
+    // Dictionary dùng để theo dõi việc trùng mã bỏ dấu trong cùng 1 đợt chạy
+    // Key: baseCode (VD: INT_CHA_CA), Value: Map(itemNameLower -> finalCode)
+    const generatedBaseCodesDict = new Map();
+
+    // 2. Lặp qua MAP_RULE để sinh item_code (áp dụng Sequence nếu trùng)
     mapRows.forEach(row => {
       const sourceGrp = String(row[idxMR.sourceGrp] || "INT").trim().toUpperCase();
       const itemName  = String(row[idxMR.itemName] || "").trim();
 
-      if (!itemName) return;
-
-      const cleanItemKey = itemName.toLowerCase().replace(/\s+/g, " ");
+      if (!itemName) return; // Chưa map tên thì bỏ qua
 
       const cleanNameNoTone = this._removeVietnameseTones(itemName)
         .replace(/[^a-zA-Z0-9\s_]/g, "")
@@ -304,69 +443,89 @@ class DataStagingService {
         .replace(/\s+/g, "_")
         .toUpperCase();
       
-      const correctCode = `${sourceGrp}_${cleanNameNoTone}`;
+      const baseCode = `${sourceGrp}_${cleanNameNoTone}`;
+      const itemNameLower = itemName.toLowerCase().trim();
+
+      // KHỞI TẠO HOẶC LẤY MAP XỬ LÝ TRÙNG LẮP
+      if (!generatedBaseCodesDict.has(baseCode)) {
+        generatedBaseCodesDict.set(baseCode, new Map());
+      }
+      const itemNamesUnderBaseCode = generatedBaseCodesDict.get(baseCode);
+
+      let correctCode = "";
+
+      // Kiểm tra xem item_name này đã từng được cấp code dưới baseCode này chưa
+      if (itemNamesUnderBaseCode.has(itemNameLower)) {
+        correctCode = itemNamesUnderBaseCode.get(itemNameLower);
+      } else {
+        // Nếu là item_name MỚI trùng baseCode với item_name KHÁC đã xử lý trước đó:
+        const currentCount = itemNamesUnderBaseCode.size;
+        if (currentCount === 0) {
+          correctCode = baseCode; // Tên đầu tiên giữ mã gốc (VD: INT_CHA_CA)
+        } else {
+          correctCode = `${baseCode}_${currentCount}`; // Tên thứ 2 trở đi nhảy số (VD: INT_CHA_CA_1)
+        }
+        itemNamesUnderBaseCode.set(itemNameLower, correctCode);
+      }
+
       activeCodeSet.add(correctCode);
 
+      // Cập nhật lại MAP_RULE nếu mã thay đổi
       if (row[idxMR.itemCode] !== correctCode) {
         row[idxMR.itemCode] = correctCode;
+        modifiedMapRows.push(row);
         generatedCount++;
       }
 
-      let masterRow = existingIMRowsByName[cleanItemKey] 
-        ? [...existingIMRowsByName[cleanItemKey]] 
+      // Chuẩn bị dòng dữ liệu cho ITEM_MASTER
+      let masterRow = existingIMMap.has(correctCode)
+        ? [...existingIMMap.get(correctCode)]
         : new Array(totalIMCols).fill("");
 
-      if (idxIM.itemCode !== -1)  masterRow[idxIM.itemCode]  = correctCode;
+      if (idxIM.itemCode  !== -1) masterRow[idxIM.itemCode]  = correctCode;
       if (idxIM.sourceGrp !== -1) masterRow[idxIM.sourceGrp] = sourceGrp;
-      if (idxIM.itemName !== -1)  masterRow[idxIM.itemName]  = itemName;
-      
-      // Xóa nhãn cảnh báo nếu mã nằm trong danh sách hoạt động
-      if (idxIM.status !== -1 && masterRow[idxIM.status] === "NEED_REVIEW") {
+      if (idxIM.itemName  !== -1) masterRow[idxIM.itemName]  = itemName;
+
+      // Đánh nhãn ACTIVE cho mã đang xuất hiện trong MAP_RULE
+      if (idxIM.status !== -1) {
         masterRow[idxIM.status] = "ACTIVE";
       }
 
-      newMasterRowsMap.set(cleanItemKey, masterRow);
+      newMasterRowsMap.set(correctCode, masterRow);
     });
 
-    // 2. Cập nhật MAP_RULE
-    if (mapRows.length > 0) {
-      this.tableRepo.upsertRowsByTableName("MAP_RULE", mapRows, ["source_grp", "raw_name"]);
+    // Ghi đè MAP_RULE
+    if (modifiedMapRows.length > 0) {
+      this.tableRepo.upsertRowsByTableName("MAP_RULE", modifiedMapRows, ["source_grp", "raw_name"]);
     }
 
-    // 3. Upsert mã chuẩn sang ITEM_MASTER
+    // Upsert ITEM_MASTER
     if (newMasterRowsMap.size > 0) {
       const masterRowsToUpsert = Array.from(newMasterRowsMap.values());
       this.tableRepo.upsertRowsByTableName("ITEM_MASTER", masterRowsToUpsert, ["item_code"]);
     }
 
-    // 4. GÁN NHÃN CẢNH BÁO 'NEED_REVIEW' VÀO CỘT STATUS CHO CÁC MÃ MỒ CÔI
-    const updatedIMInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
-    if (updatedIMInfo && updatedIMInfo.values && updatedIMInfo.values.length > 1 && idxIM.status !== -1) {
-      const currentIMRows = updatedIMInfo.values.slice(1);
-      const flaggedRows = [];
+    // 3. CLEAN MÃ MỒ CÔI: Đánh dấu NEED_REVIEW cho mã không còn xuất hiện trong MAP_RULE
+    if (idxIM.status !== -1) {
+      const orphanRows = [];
 
-      currentIMRows.forEach(row => {
-        const code = String(row[idxIM.itemCode] || "").trim();
-        // Mã tồn tại trong ITEM_MASTER nhưng không xuất hiện trong MAP_RULE hiện tại
-        if (code && !activeCodeSet.has(code)) {
-          row[idxIM.status] = "NEED_REVIEW";
-          flaggedRows.push(row);
+      existingIMMap.forEach((row, code) => {
+        if (!activeCodeSet.has(code)) {
+          if (String(row[idxIM.status] || "").trim() !== "NEED_REVIEW") {
+            row[idxIM.status] = "NEED_REVIEW";
+            orphanRows.push(row);
+          }
         }
       });
 
-      if (flaggedRows.length > 0) {
-        this.tableRepo.upsertRowsByTableName("ITEM_MASTER", flaggedRows, ["item_code"]);
-        Logger.log(`[FLAG ORPHANS] Đã cập nhật status = NEED_REVIEW cho ${flaggedRows.length} mã mồ côi.`);
+      if (orphanRows.length > 0) {
+        this.tableRepo.upsertRowsByTableName("ITEM_MASTER", orphanRows, ["item_code"]);
       }
     }
 
-    Logger.log(`[GEN CODE] Hoàn tất sinh & đồng bộ ${generatedCount} mã item_code chuẩn.`);
     return generatedCount;
   }
 
-  /**
-   * BƯỚC 3: Đồng bộ cặp (item_name, item_code) từ MAP_RULE sang bảng STAGING
-   */
   updateStagingMappedFields(sourceGroup, filter = null) {
     const srcMeta = this.sysConfigService.getSourceMetadata(sourceGroup);
     const stgSchemaName = srcMeta.stgSchema;
@@ -406,43 +565,57 @@ class DataStagingService {
 
     const stgRows = stgDataInfo.values.slice(1);
     let updatedCount = 0;
+    const modifiedStgRows = [];
 
-    const updatedStgRows = stgRows.map(row => {
+    stgRows.forEach(row => {
       if (filter && filter.key && filter.values && idxSTG.period !== -1) {
         const periodVal = String(row[idxSTG.period] || "").trim();
         const targetPeriods = filter.values.map(v => String(v).trim());
-        if (!targetPeriods.includes(periodVal)) return row;
+        if (!targetPeriods.includes(periodVal)) return;
       }
 
       const rawName = String(row[idxSTG.rawName] || "").trim().toLowerCase();
       if (rawName && mapDict[rawName]) {
-        const updatedRow = [...row];
-        if (idxSTG.itemName !== -1) updatedRow[idxSTG.itemName] = mapDict[rawName].itemName;
-        if (idxSTG.itemCode !== -1) updatedRow[idxSTG.itemCode] = mapDict[rawName].itemCode;
-        updatedCount++;
-        return updatedRow;
+        const targetName = mapDict[rawName].itemName;
+        const targetCode = mapDict[rawName].itemCode;
+
+        const currentName = idxSTG.itemName !== -1 ? String(row[idxSTG.itemName] || "").trim() : "";
+        const currentCode = idxSTG.itemCode !== -1 ? String(row[idxSTG.itemCode] || "").trim() : "";
+
+        if (currentName !== targetName || currentCode !== targetCode) {
+          const updatedRow = [...row];
+          if (idxSTG.itemName !== -1) updatedRow[idxSTG.itemName] = targetName;
+          if (idxSTG.itemCode !== -1) updatedRow[idxSTG.itemCode] = targetCode;
+          modifiedStgRows.push(updatedRow);
+          updatedCount++;
+        }
       }
-      return row;
     });
 
-    if (updatedCount > 0) {
-      this.tableRepo.upsertRowsByTableName(stgSchemaName, updatedStgRows, srcMeta.primaryKeys);
-      Logger.log(`[STAGING SYNC] Đã cập nhật item_name/item_code cho ${updatedCount} dòng trên [${stgSchemaName}].`);
+    if (modifiedStgRows.length > 0) {
+      this.tableRepo.upsertRowsByTableName(stgSchemaName, modifiedStgRows, srcMeta.primaryKeys);
     }
 
     return updatedCount;
   }
 
-  // ==========================================
-  // FACT PREPARATION EXTENSIONS (BUOC 4A & 4B)
-  // ==========================================
-
-  /**
-   * BƯỚC 4A: Bootstrap & Đồng bộ các cặp đơn vị quy đổi (alt_unit) từ STG sang UNIT_CONVERSION
-   */
+  /** bootstrap unit_conversion */
   bootstrapUnitConversionFromStaging() {
+    // 1. Lấy Active Set từ MAP_RULE và Dict từ ITEM_MASTER (Đã được hoàn thiện trước đó)
+    const mapRuleInfo = this.tableRepo.getDataByTableName("MAP_RULE");
+    const activeItemCodes = new Set();
+    if (mapRuleInfo && mapRuleInfo.values && mapRuleInfo.values.length > 1) {
+      const idxMRCode = this._getColIndex("MAP_RULE", "item_code");
+      if (idxMRCode !== -1) {
+        mapRuleInfo.values.slice(1).forEach(r => {
+          const code = String(r[idxMRCode] || "").trim();
+          if (code) activeItemCodes.add(code);
+        });
+      }
+    }
+
     const imDict = this._buildItemMasterDict();
-    
+
     const ucInfo = this.tableRepo.getDataByTableName("UNIT_CONVERSION");
     const ucRows = ucInfo ? ucInfo.values : [];
 
@@ -452,33 +625,47 @@ class DataStagingService {
     const rawKwIdx  = this._getColIndex("UNIT_CONVERSION", "raw_keyword");
     const baseIdx   = this._getColIndex("UNIT_CONVERSION", "base_unit");
     const factorIdx = this._getColIndex("UNIT_CONVERSION", "conversion_factor");
+    const statusIdx = this._getColIndex("UNIT_CONVERSION", "status");
 
-    if (grpIdx === -1 || codeIdx === -1 || altIdx === -1 || baseIdx === -1) {
-      throw new Error("[Schema Error] Bảng UNIT_CONVERSION thiếu các cấu hình col_key bắt buộc trong SCHEMA.");
-    }
+    if (grpIdx === -1 || codeIdx === -1 || altIdx === -1) return 0;
 
     const schemaMap = this.schemaService.getSchemaMap();
     const ucColsConfig = schemaMap["UNIT_CONVERSION"] ? schemaMap["UNIT_CONVERSION"].columns : {};
-    const totalCols = Math.max(...Object.values(ucColsConfig), 6);
+    const totalCols = Math.max(...Object.values(ucColsConfig), 7);
 
     const existingMap = new Map();
+    const rowsToUpsert = [];
 
+    // 2. Load các dòng hiện có của UNIT_CONVERSION & đồng bộ lại Status theo MAP_RULE
     if (ucRows && ucRows.length > 1) {
       for (let i = 1; i < ucRows.length; i++) {
         const g = String(ucRows[i][grpIdx] || "INT").trim().toUpperCase();
         const c = String(ucRows[i][codeIdx] || "").trim();
         const u = String(ucRows[i][altIdx] || "").trim().toLowerCase();
+
         if (c && u) {
-          existingMap.set(`${g}___${c}___${u}`, ucRows[i]);
+          const fullRow = [...ucRows[i]];
+          while (fullRow.length < totalCols) fullRow.push("");
+
+          if (statusIdx !== -1) {
+            const currentStatus = String(fullRow[statusIdx] || "").trim();
+            const targetStatus = activeItemCodes.has(c) ? "ACTIVE" : "NEED_REVIEW";
+
+            if (currentStatus !== targetStatus) {
+              fullRow[statusIdx] = targetStatus;
+              rowsToUpsert.push(fullRow);
+            }
+          }
+
+          existingMap.set(`${g}___${c}___${u}`, fullRow);
         }
       }
     }
 
-    const rowsToUpsert = [];
+    // 3. Chỉ quét các nguồn phát sinh giao dịch (PO, SO) - LOẠI BỎ STG_INVENTORY_OPENING
     const stgTables = [
       { name: "STG_PO_INVOICE", grp: "INT" },
-      { name: "STG_SO_INVOICE", grp: "OUT" },
-      { name: "STG_INVENTORY_OPENING", grp: "INT" }
+      { name: "STG_SO_INVOICE", grp: "OUT" }
     ];
 
     stgTables.forEach(t => {
@@ -486,8 +673,13 @@ class DataStagingService {
       const rows = stgInfo ? stgInfo.values : [];
       if (!rows || rows.length <= 1) return;
 
-      const codeStgIdx = this._getColIndex(t.name, "item_code");
-      const unitStgIdx = this._getColIndex(t.name, "unit");
+      // Đọc chỉ số cột trực tiếp từ Header thực tế của Staging
+      const stgHeaders = rows[0].map(h => String(h || "").trim().toLowerCase());
+      let codeStgIdx = stgHeaders.indexOf("item_code");
+      let unitStgIdx = stgHeaders.indexOf("unit");
+
+      if (codeStgIdx === -1) codeStgIdx = this._getColIndex(t.name, "item_code");
+      if (unitStgIdx === -1) unitStgIdx = this._getColIndex(t.name, "unit");
 
       if (codeStgIdx === -1 || unitStgIdx === -1) return;
 
@@ -497,56 +689,39 @@ class DataStagingService {
         if (!itemCode || !stgUnit) continue;
 
         const imData   = imDict[itemCode] || {};
-        const newBaseUnit = String(imData.baseUnit || "").trim().toLowerCase();
+        const baseUnit = String(imData.baseUnit || "").trim().toLowerCase();
 
-        if (newBaseUnit && stgUnit !== newBaseUnit) {
+        // ĐIỀU KIỆN QUAN TRỌNG: Chỉ tạo rule quy đổi nếu đơn vị giao dịch khác đơn vị cơ bản
+        if (baseUnit && stgUnit !== baseUnit) {
           const key = `${t.grp}___${itemCode}___${stgUnit}`;
 
           if (!existingMap.has(key)) {
             const newRow = new Array(totalCols).fill("");
-            
             newRow[grpIdx] = t.grp;
             newRow[codeIdx] = itemCode;
-            newRow[altIdx] = stgUnit;
+            newRow[altIdx] = stgUnit; // Đơn vị mua/bán lẻ (ví dụ: thùng)
             if (rawKwIdx !== -1)  newRow[rawKwIdx] = stgUnit;
-            newRow[baseIdx] = newBaseUnit;
-            if (factorIdx !== -1) newRow[factorIdx] = 1;
+            if (baseIdx !== -1)   newRow[baseIdx] = baseUnit; // Đơn vị chuẩn kho (ví dụ: lon)
+            if (factorIdx !== -1) newRow[factorIdx] = "";    // Chờ người dùng điền hệ số quy đổi
+            if (statusIdx !== -1) {
+              newRow[statusIdx] = activeItemCodes.has(itemCode) ? "ACTIVE" : "NEED_REVIEW";
+            }
 
             existingMap.set(key, newRow);
             rowsToUpsert.push(newRow);
-          } else {
-            const existingRow = existingMap.get(key);
-            const currentBaseUnit = String(existingRow[baseIdx] || "").trim().toLowerCase();
-
-            if (currentBaseUnit !== newBaseUnit) {
-              existingRow[baseIdx] = newBaseUnit;
-              rowsToUpsert.push(existingRow);
-            }
           }
         }
       }
     });
 
+    // 4. Upsert danh sách rule quy đổi mới/cập nhật vào UNIT_CONVERSION
     if (rowsToUpsert.length > 0) {
       this.tableRepo.upsertRowsByTableName("UNIT_CONVERSION", rowsToUpsert, ["source_grp", "item_code", "alt_unit"]);
-      Logger.log(`[BOOTSTRAP UC] Đã đồng bộ/thêm mới ${rowsToUpsert.length} dòng quy đổi vào UNIT_CONVERSION.`);
     }
 
     return rowsToUpsert.length;
   }
 
-  /**
-   * BƯỚC 4B: Tự động gán Mã Tồn kho Quy chuẩn (inventory_sku) cho ITEM_MASTER từ AUTO_SKU_RULE
-   * 
-   * Quy tắc xử lý:
-   * 1. Lọc bỏ các mặt hàng thuộc nhóm không tính tồn kho (cấu hình động via SysConfig KEY: NON_INVENTORY_ITEM_TYPES).
-   * 2. Quét các quy tắc AUTO_SKU_RULE theo thứ tự priority tăng dần (số nhỏ chạy trước).
-   * 3. Fallback: Nếu không khớp rule, nhóm INT được phép lấy tạm item_code làm inventory_sku;
-   *    Nhóm OUT không tự fallback (giữ rỗng và ghi log cảnh báo validation).
-   * 
-   * @param {boolean} overwriteExisting - Có ghi đè mã inventory_sku đã tồn tại hay không
-   * @returns {number} Số lượng dòng trong ITEM_MASTER được cập nhật
-   */
   applyAutoSkuRules(overwriteExisting = false) {
     const imInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
     const autoSkuInfo = this.tableRepo.getDataByTableName("AUTO_SKU_RULE");
@@ -554,7 +729,6 @@ class DataStagingService {
     if (!imInfo || !imInfo.values || imInfo.values.length <= 1) return 0;
     if (!autoSkuInfo || !autoSkuInfo.values || autoSkuInfo.values.length <= 1) return 0;
 
-    // Lấy danh sách item_type không quản lý tồn kho từ SysConfig (Dynamic Key, không hardcode)
     const rawNonInvConfig = this.sysConfigService.getConfig("NON_INVENTORY_ITEM_TYPES") || [];
     const nonInventoryTypes = (Array.isArray(rawNonInvConfig) ? rawNonInvConfig : String(rawNonInvConfig).split(","))
       .map(t => String(t).trim().toUpperCase())
@@ -584,7 +758,6 @@ class DataStagingService {
       priority:  prioIdx
     };
 
-    // Chuẩn hóa và Sắp xếp Rule theo Priority tăng dần (Số nhỏ hơn chạy trước)
     const autoRules = autoSkuInfo.values.slice(1)
       .map(r => ({
         sourceGrp: idxAS.sourceGrp !== -1 ? String(r[idxAS.sourceGrp] || "").trim().toUpperCase() : "",
@@ -596,8 +769,8 @@ class DataStagingService {
       .sort((a, b) => a.priority - b.priority);
 
     const imRows = imInfo.values.slice(1);
+    const modifiedImRows = [];
     let updatedCount = 0;
-    const unmappedOutItems = [];
 
     imRows.forEach(row => {
       const imGrp = idxIM.grp !== -1 ? String(row[idxIM.grp] || "").trim().toUpperCase() : "";
@@ -606,43 +779,34 @@ class DataStagingService {
       const itemType = idxIM.type !== -1 ? String(row[idxIM.type] || "").trim().toUpperCase() : "";
       let currentSku = String(row[idxIM.sku] || "").trim();
 
-      // Bỏ qua các mặt hàng thuộc loại không tính tồn kho theo cấu hình trong SysConfig
       if (itemType && nonInventoryTypes.includes(itemType)) return;
 
       const needUpdate = !currentSku || overwriteExisting;
 
       if (needUpdate && itemName) {
-        // 1. Tìm quy tắc khớp trong AUTO_SKU_RULE
         const matchedRule = autoRules.find(rule => {
           const matchGrp = (!rule.sourceGrp || rule.sourceGrp === "ALL" || rule.sourceGrp === imGrp);
           if (!matchGrp) return false;
           return rule.regExps.some(rx => rx.test(itemName));
         });
 
+        let targetSku = "";
         if (matchedRule) {
-          row[idxIM.sku] = matchedRule.targetSku;
+          targetSku = matchedRule.targetSku;
+        } else if (imGrp === "INT") {
+          targetSku = imCode;
+        }
+
+        if (targetSku && targetSku !== currentSku) {
+          row[idxIM.sku] = targetSku;
+          modifiedImRows.push(row);
           updatedCount++;
-        } else {
-          // 2. Phân luồng Fallback khi KHÔNG MATCH RULE:
-          if (imGrp === "INT") {
-            // Hàng nhập mua (INT): Cho phép lấy tạm item_code làm inventory_sku
-            row[idxIM.sku] = imCode;
-            updatedCount++;
-          } else if (imGrp === "OUT") {
-            // Hàng bán ra (OUT): Tuyệt đối KHÔNG tự fallback, giữ rỗng và thu thập danh sách báo cảnh báo
-            unmappedOutItems.push(`${imCode} - ${itemName}`);
-          }
         }
       }
     });
 
-    if (updatedCount > 0) {
-      this.tableRepo.upsertRowsByTableName("ITEM_MASTER", imRows, ["item_code"]);
-      Logger.log(`[AUTO SKU] Đã cập nhật mã inventory_sku cho ${updatedCount} mặt hàng trong ITEM_MASTER.`);
-    }
-
-    if (unmappedOutItems.length > 0) {
-      Logger.log(`[WARNING AUTO SKU] Phát hiện ${unmappedOutItems.length} mặt hàng OUT chưa được map inventory_sku: \n - ${unmappedOutItems.join("\n - ")}`);
+    if (modifiedImRows.length > 0) {
+      this.tableRepo.upsertRowsByTableName("ITEM_MASTER", modifiedImRows, ["item_code"]);
     }
 
     return updatedCount;
@@ -657,7 +821,10 @@ class DataStagingService {
     const updatedStg = this.updateStagingMappedFields(sourceGroup, filter);
 
     this.bootstrapUnitConversionFromStaging();
-    this.applyAutoSkuRules(); // Đã đổi tên gọn nhẹ
+    this.applyAutoSkuRules();
+
+    // Tối ưu quan trọng: Ép xả bộ đệm ngay khi kết thúc xử lý ghi dữ liệu
+    SpreadsheetApp.flush();
 
     return updatedStg;
   }

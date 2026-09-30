@@ -1,197 +1,144 @@
 /**
- * Lớp Quản lý Định mức Công thức Đa cấp (Multi-level BOM / Recipe Service)
- * Hỗ trợ lưu trữ lịch sử áp dụng (SCD Type 2) và xả đệ quy theo thời gian/kỳ hạch toán.
+ * [SERVICE] BomService.js - Optimized with In-Memory Cache
  */
 class BomService {
-  /**
-   * @param {TableRepository} tableRepo - Repository quản lý đọc/ghi dữ liệu bảng
-   */
-  constructor(tableRepo) {
+  constructor(tableRepo, configService = null) {
     this.tableRepo = tableRepo;
+    this.configService = configService;
+    this.KEY_DELIMITER = "___";
+    this._cachedBomMap = null; // Cache map để không re-query Sheet liên tục
   }
 
-  // ==========================================
-  // 1. BOOTSTRAP DỮ LIỆU BAN ĐẦU TỪ ITEM_MASTER
-  // ==========================================
+  _getColIdx(headerRow, colKey) {
+    if (!headerRow) return -1;
+    return headerRow.findIndex(cell => String(cell || "").trim().toLowerCase() === colKey.toLowerCase());
+  }
 
-  /**
-   * Khởi tạo danh mục BOM từ ITEM_MASTER (nhóm OUT/SO)
-   * Đảm bảo kiểm tra Unique Key: (parent_item_code + child_item_code)
-   * 
-   * @returns {number} Số dòng BOM mới được chèn thêm
-   */
-  bootstrapBomFromItemMaster() {
-    const itemMasterInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
-    const bomInfo        = this.tableRepo.getDataByTableName("BOM_RECIPE");
+  _resolveTargetDate(timeInput) {
+    if (!timeInput) return new Date();
+    if (timeInput instanceof Date) return timeInput;
 
-    const itemRows = itemMasterInfo ? itemMasterInfo.values : [];
-    const bomRows  = bomInfo ? bomInfo.values : [];
+    const str = String(timeInput).trim();
+    const cleanStr = str.replace(/[^0-9]/g, "");
 
-    if (!itemRows || itemRows.length <= 1) {
-      Logger.log("[BOOTSTRAP BOM] Bảng ITEM_MASTER không có dữ liệu.");
-      return 0;
+    if (cleanStr.length === 6) {
+      const year  = parseInt(cleanStr.substring(0, 4), 10);
+      const month = parseInt(cleanStr.substring(4, 6), 10);
+      return new Date(year, month, 0, 23, 59, 59);
     }
 
-    // Lấy chỉ mục cột trên ITEM_MASTER
-    const idxItemCode   = this._getColIdx(itemRows[0], "item_code");
-    const idxItemName   = this._getColIdx(itemRows[0], "item_name");
-    const idxSourceGrp  = this._getColIdx(itemRows[0], "source_grp");
-    const idxIngredient = this._getColIdx(itemRows[0], "ingredient_code");
-    const idxBaseUnit   = this._getColIdx(itemRows[0], "base_unit");
+    const parsedDate = new Date(str);
+    return isNaN(parsedDate.getTime()) ? new Date() : parsedDate;
+  }
 
-    // Lấy tập hợp Unique Keys (parent|child) đã tồn tại trong BOM_RECIPE
-    const existingBomKeys = new Set();
-    if (bomRows.length > 1) {
-      const idxBomParent = this._getColIdx(bomRows[0], "parent_item_code");
-      const idxBomChild  = this._getColIdx(bomRows[0], "child_item_code");
+  _isDateWithinRange(targetDate, effFrom, effTo) {
+    const parseToTimestamp = (d, defaultStr) => {
+      if (!d) return new Date(defaultStr).getTime();
+      if (d instanceof Date) return d.getTime();
+      
+      const str = String(d).trim().replace(/\//g, "-");
+      const p = new Date(str);
+      return isNaN(p.getTime()) ? new Date(defaultStr).getTime() : p.getTime();
+    };
+
+    const tTime = parseToTimestamp(targetDate, "2026-01-01");
+    const fTime = parseToTimestamp(effFrom, "1900-01-01");
+    const eTime = parseToTimestamp(effTo, "2099-12-31");
+
+    return tTime >= fTime && tTime <= eTime;
+  }
+
+  bootstrapBomFromItemMaster() {
+    this.clearCache(); // Reset cache khi bootstrap lại
+    const imInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
+    const imRows = imInfo ? imInfo.values : [];
+    if (!imRows || imRows.length <= 1) return 0;
+
+    const imHeaders = imRows[0];
+    const idxItemCode = this._getColIdx(imHeaders, "item_code");
+    const idxInvSku  = this._getColIdx(imHeaders, "inventory_sku") !== -1 
+                        ? this._getColIdx(imHeaders, "inventory_sku") 
+                        : this._getColIdx(imHeaders, "inventory_code");
+    const idxUnit    = this._getColIdx(imHeaders, "base_unit");
+
+    const bomInfo = this.tableRepo.getDataByTableName("BOM_RECIPE");
+    const bomRows = bomInfo ? bomInfo.values : [];
+    const existingPairs = new Set();
+
+    if (bomRows && bomRows.length > 1) {
+      const bomHeaders = bomRows[0];
+      const idxParent  = this._getColIdx(bomHeaders, "parent_item_code");
+      const idxChild   = this._getColIdx(bomHeaders, "child_item_code");
 
       for (let r = 1; r < bomRows.length; r++) {
-        const parent = String(bomRows[r][idxBomParent] || "").trim();
-        const child  = idxBomChild !== -1 ? String(bomRows[r][idxBomChild] || "").trim() : "";
-        if (parent) {
-          existingBomKeys.add(`${parent}|${child}`);
+        const p = String(bomRows[r][idxParent] || "").trim();
+        const c = String(bomRows[r][idxChild] || "").trim();
+        if (p && c) {
+          existingPairs.add(`${p}${this.KEY_DELIMITER}${c}`);
         }
       }
     }
 
     const newBomRows = [];
-    const defaultFromDate = "2026-01-01";
-    const defaultToDate   = "2099-12-31";
+    const primaryKeys = ["parent_item_code", "child_item_code"];
 
-    for (let i = 1; i < itemRows.length; i++) {
-      const row = itemRows[i];
-      const sourceGrp = String(row[idxSourceGrp] || "").trim().toUpperCase();
-      const itemCode  = String(row[idxItemCode] || "").trim();
-      const itemName  = String(row[idxItemName] || "").trim();
-      const ingCode   = idxIngredient !== -1 ? String(row[idxIngredient] || "").trim() : "";
-      const baseUnit  = idxBaseUnit !== -1 ? String(row[idxBaseUnit] || "").trim() : "ĐĨA";
+    for (let r = 1; r < imRows.length; r++) {
+      const parentCode = String(imRows[r][idxItemCode] || "").trim();
+      let childCode    = idxInvSku !== -1 ? String(imRows[r][idxInvSku] || "").trim() : "";
+      
+      if (!childCode) childCode = parentCode;
+      if (!parentCode || !childCode) continue;
 
-      // Lọc danh mục món bán (OUT/SO)
-      if ((sourceGrp === "OUT" || sourceGrp === "SO") && itemCode) {
-        const childCode = ingCode !== "" ? ingCode : "";
-        const compositeKey = `${itemCode}|${childCode}`;
-
-        if (!existingBomKeys.has(compositeKey)) {
-          if (ingCode !== "") {
-            // Kịch bản A: Món bán theo NVL / Bán thẳng (1-1)
-            newBomRows.push([
-              itemCode,           // parent_item_code
-              ingCode,            // child_item_code
-              1,                  // std_qty
-              baseUnit,           // unit
-              1,                  // bom_level
-              true,               // is_leaf
-              defaultFromDate,    // effective_from
-              defaultToDate,      // effective_to
-              true,               // is_active
-              "Auto Bootstrap (Món bán theo NVL/Bán thẳng)" // note
-            ]);
-          } else {
-            // Kịch bản B: Món chế biến phức tạp -> Tạo khung chờ nhập định mức
-            newBomRows.push([
-              itemCode,           // parent_item_code
-              "",                 // child_item_code (chờ điền)
-              0,                  // std_qty
-              "KG",               // unit mặc định
-              1,                  // bom_level
-              true,               // is_leaf
-              defaultFromDate,    // effective_from
-              defaultToDate,      // effective_to
-              false,              // is_active (False cho đến khi điền xong)
-              "Auto Bootstrap (Chờ nhập định mức NVL con)" // note
-            ]);
-          }
-          existingBomKeys.add(compositeKey);
-        }
+      const pairKey = `${parentCode}${this.KEY_DELIMITER}${childCode}`;
+      if (!existingPairs.has(pairKey)) {
+        const unit = idxUnit !== -1 ? String(imRows[r][idxUnit] || "").trim().toLowerCase() : "";
+        
+        newBomRows.push([
+          parentCode, childCode, 1, unit, 1, true, "2026-01-01", "2099-12-31", true
+        ]);
+        existingPairs.add(pairKey);
       }
     }
 
-    // Ghi nối tiếp vào BOM_RECIPE
     if (newBomRows.length > 0) {
-      const updatedBomTable = bomRows.concat(newBomRows);
-      this.tableRepo.updateTableData("BOM_RECIPE", updatedBomTable);
-      Logger.log(`[BOOTSTRAP BOM] Đã thêm ${newBomRows.length} dòng vào BOM_RECIPE.`);
+      this.tableRepo.upsertRowsByTableName("BOM_RECIPE", newBomRows, primaryKeys);
+      Logger.log(`[BOM SERVICE] Đã khởi tạo mới ${newBomRows.length} bản ghi BOM vào BOM_RECIPE.`);
     }
 
     return newBomRows.length;
   }
 
-  // ==========================================
-  // 2. THUẬT TOÁN ĐỆ QUY XẢ PHẲNG BOM ĐA CẤP
-  // ==========================================
-
-  /**
-   * Xả phẳng món bán ra danh sách NVL thô cuối cùng theo thời điểm/kỳ hạch toán
-   * 
-   * @param {string} parentCode - Mã món bán (OUT) hoặc BTP cha
-   * @param {number} parentQty - Số lượng món bán
-   * @param {string|Date} targetTime - trans_date (VD: '2026-08-15') hoặc period (VD: '2026-01')
-   * @returns {Array<{ingredientCode: string, totalQty: number, unit: string}>} Danh sách NVL thô
-   */
-  explodeBom(parentCode, parentQty = 1, targetTime = new Date()) {
-    const targetDate = this._resolveTargetDate(targetTime);
-    const bomMap = this._loadEffectiveBomMap(targetDate);
-    const explodedResults = [];
-
-    // Hàm đệ quy duyệt cây công thức
-    const recurse = (currentParent, currentQty) => {
-      const children = bomMap.get(currentParent) || [];
-
-      // Node lá không có con trong BOM -> Coi chính nó là NVL thô
-      if (children.length === 0) {
-        explodedResults.push({
-          ingredientCode: currentParent,
-          totalQty: currentQty,
-          unit: ""
-        });
-        return;
-      }
-
-      for (const child of children) {
-        const reqQty = currentQty * child.stdQty;
-
-        if (child.isLeaf || !bomMap.has(child.childItemCode)) {
-          // Là nguyên liệu thô (Leaf Node)
-          explodedResults.push({
-            ingredientCode: child.childItemCode,
-            totalQty: reqQty,
-            unit: child.unit
-          });
-        } else {
-          // Là Bán thành phẩm -> Đệ quy xả tiếp xuống cấp dưới
-          recurse(child.childItemCode, reqQty);
-        }
-      }
-    };
-
-    recurse(parentCode, parentQty);
-
-    // Gom nhóm các NVL trùng nhau sau đệ quy
-    return this._consolidateIngredients(explodedResults);
+  clearCache() {
+    this._cachedBomMap = null;
   }
 
-  // ==========================================
-  // 3. TIỆN ÍCH HỖ TRỢ XỬ LÝ LỊCH SỬ & THỜI GIAN
-  // ==========================================
-
   /**
-   * Nạp toàn bộ BOM_RECIPE đang CÓ HIỆU LỰC tại thời điểm targetDate vào Map bộ nhớ
+   * Tải Map danh sách BOM hợp lệ - Có Cache In-Memory
    */
   _loadEffectiveBomMap(targetDate) {
+    if (this._cachedBomMap) {
+      return this._cachedBomMap;
+    }
+
     const bomInfo = this.tableRepo.getDataByTableName("BOM_RECIPE");
     const bomRows = bomInfo ? bomInfo.values : [];
     const bomMap = new Map();
 
-    if (!bomRows || bomRows.length <= 1) return bomMap;
+    if (!bomRows || bomRows.length <= 1) {
+      this._cachedBomMap = bomMap;
+      return bomMap;
+    }
 
-    const idxParent = this._getColIdx(bomRows[0], "parent_item_code");
-    const idxChild  = this._getColIdx(bomRows[0], "child_item_code");
-    const idxQty    = this._getColIdx(bomRows[0], "std_qty");
-    const idxUnit   = this._getColIdx(bomRows[0], "unit");
-    const idxLeaf   = this._getColIdx(bomRows[0], "is_leaf");
-    const idxFrom   = this._getColIdx(bomRows[0], "effective_from");
-    const idxTo     = this._getColIdx(bomRows[0], "effective_to");
-    const idxActive = this._getColIdx(bomRows[0], "is_active");
+    const headers   = bomRows[0];
+    const idxParent = this._getColIdx(headers, "parent_item_code");
+    const idxChild  = this._getColIdx(headers, "child_item_code");
+    const idxQty    = this._getColIdx(headers, "std_qty");
+    const idxUnit   = this._getColIdx(headers, "unit");
+    const idxLevel  = this._getColIdx(headers, "bom_level");
+    const idxLeaf   = this._getColIdx(headers, "is_leaf");
+    const idxFrom   = this._getColIdx(headers, "effective_from");
+    const idxTo     = this._getColIdx(headers, "effective_to");
+    const idxActive = this._getColIdx(headers, "is_active");
 
     for (let r = 1; r < bomRows.length; r++) {
       const row = bomRows[r];
@@ -199,97 +146,91 @@ class BomService {
       const child  = String(row[idxChild] || "").trim();
       const qty    = Number(row[idxQty]) || 0;
       const unit   = String(row[idxUnit] || "").trim();
-      const isLeaf = String(row[idxLeaf] || "").toLowerCase() === "true" || row[idxLeaf] === true;
-      const isActive = String(row[idxActive] || "").toLowerCase() === "true" || row[idxActive] === true;
+      const level  = idxLevel !== -1 ? (Number(row[idxLevel]) || 1) : 1;
+      
+      const strLeaf   = String(row[idxLeaf] || "").trim().toUpperCase();
+      const isLeaf    = strLeaf === "TRUE" || strLeaf === "1" || row[idxLeaf] === true;
+      
+      const strActive = idxActive !== -1 ? String(row[idxActive] || "").trim().toUpperCase() : "TRUE";
+      const isActive  = strActive === "TRUE" || strActive === "1" || row[idxActive] === true;
 
       if (!parent || !child || !isActive) continue;
 
-      // Kiểm tra khoảng ngày hiệu lực (SCD Type 2)
-      const effFrom = row[idxFrom];
-      const effTo   = row[idxTo];
+      const effFrom = idxFrom !== -1 ? row[idxFrom] : null;
+      const effTo   = idxTo !== -1 ? row[idxTo] : null;
 
       if (this._isDateWithinRange(targetDate, effFrom, effTo)) {
         if (!bomMap.has(parent)) {
           bomMap.set(parent, []);
         }
         bomMap.get(parent).push({
+          parentItemCode: parent,
           childItemCode: child,
           stdQty: qty,
           unit: unit,
+          bomLevel: level,
           isLeaf: isLeaf
         });
       }
     }
 
+    this._cachedBomMap = bomMap;
     return bomMap;
   }
 
-  /**
-   * Chuyển đổi đầu vào (trans_date hoặc period) về chuẩn Ngày đối soát
-   * Quy ước: Nếu truyền vào period (YYYY-MM), quy đổi về NGÀY CUỐI THÁNG.
-   */
-  _resolveTargetDate(timeInput) {
-    if (timeInput instanceof Date) {
-      return timeInput;
-    }
+  explodeBom(parentCode, parentQty = 1, targetTime = new Date()) {
+    const targetDate = this._resolveTargetDate(targetTime);
+    const bomMap = this._loadEffectiveBomMap(targetDate);
+    const explodedResults = [];
 
-    const str = String(timeInput || "").trim();
+    const recurse = (currentParent, currentQty, depth = 1) => {
+      const children = bomMap.get(currentParent) || [];
 
-    // Nếu dạng period: "2026-01" hoặc "202601" (Độ dài <= 7)
-    if (str.length <= 7) {
-      const cleanStr = str.replace(/[^0-9]/g, "");
-      if (cleanStr.length >= 6) {
-        const year  = parseInt(cleanStr.substring(0, 4), 10);
-        const month = parseInt(cleanStr.substring(4, 6), 10);
-        // Trả về ngày cuối cùng của tháng
-        return new Date(year, month, 0);
+      if (children.length === 0) return;
+
+      for (const child of children) {
+        const reqQty = currentQty * child.stdQty;
+
+        if (child.isLeaf || !bomMap.has(child.childItemCode)) {
+          explodedResults.push({
+            parentItemCode: currentParent,
+            childItemCode: child.childItemCode,
+            child_item_code: child.childItemCode,
+            stdQty: child.stdQty,
+            std_qty: child.stdQty,
+            totalQty: reqQty,
+            unit: child.unit,
+            bomLevel: child.bomLevel || depth,
+            bom_level: child.bomLevel || depth,
+            isLeaf: child.isLeaf
+          });
+        } else {
+          recurse(child.childItemCode, reqQty, depth + 1);
+        }
       }
-    }
+    };
 
-    // Trường hợp chuỗi trans_date tiêu chuẩn ("2026-08-15")
-    const parsedDate = new Date(str);
-    return isNaN(parsedDate.getTime()) ? new Date() : parsedDate;
+    recurse(String(parentCode || "").trim(), parentQty, 1);
+    return explodedResults;
   }
 
-  /**
-   * So sánh targetDate nằm trong khoảng [effFrom, effTo]
-   */
-  _isDateWithinRange(targetDate, effFrom, effTo) {
-    const tDate = new Date(targetDate);
-    const fDate = effFrom ? new Date(effFrom) : new Date("1900-01-01");
-    const tToDate = effTo ? new Date(effTo) : new Date("2099-12-31");
+  getDirectRecipe(parentCode, targetTime = new Date()) {
+    const targetDate = this._resolveTargetDate(targetTime);
+    const bomMap = this._loadEffectiveBomMap(targetDate);
+    const cleanParent = String(parentCode || "").trim();
+    const children = bomMap.get(cleanParent) || [];
 
-    tDate.setHours(0, 0, 0, 0);
-    fDate.setHours(0, 0, 0, 0);
-    tToDate.setHours(0, 0, 0, 0);
-
-    return tDate >= fDate && tDate <= tToDate;
-  }
-
-  /**
-   * Gom nhóm danh sách NVL trùng nhau sau khi xả đệ quy
-   */
-  _consolidateIngredients(rawList) {
-    const summaryMap = new Map();
-
-    for (const item of rawList) {
-      const key = item.ingredientCode;
-      if (summaryMap.has(key)) {
-        summaryMap.get(key).totalQty += item.totalQty;
-      } else {
-        summaryMap.set(key, {
-          ingredientCode: item.ingredientCode,
-          totalQty: item.totalQty,
-          unit: item.unit || ""
-        });
-      }
-    }
-
-    return Array.from(summaryMap.values());
-  }
-
-  _getColIdx(headerRow, colKey) {
-    if (!headerRow) return -1;
-    return headerRow.findIndex(cell => String(cell || "").trim().toLowerCase() === colKey.toLowerCase());
+    return children.map(c => ({
+      parentItemCode: cleanParent,
+      childItemCode: c.childItemCode,
+      child_item_code: c.childItemCode,
+      stdQty: c.stdQty,
+      std_qty: c.stdQty,
+      totalQty: c.stdQty,
+      unit: c.unit,
+      bomLevel: c.bomLevel || 1,
+      bom_level: c.bomLevel || 1,
+      isLeaf: c.isLeaf
+    }));
   }
 }

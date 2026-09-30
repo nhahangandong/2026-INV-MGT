@@ -3,11 +3,14 @@
  * Điểm điều phối chính cho các tác vụ tổng hợp Fact và tính toán quy đổi.
  */
 class FactController {
-  constructor() {
-    this.tableRepo = new TableRepository();
-    this.schemaService = new SchemaService(this.tableRepo);
-    this.sysConfigService = new SysConfigService(this.tableRepo);
-    this.bomService = typeof BOMService !== 'undefined' ? new BOMService(this.tableRepo) : null;
+  constructor(tableRepo = null, schemaService = null, sysConfigService = null) {
+    this.tableRepo = tableRepo || new TableRepository();
+    this.schemaService = schemaService || new SchemaService(this.tableRepo);
+    this.sysConfigService = sysConfigService || new SysConfigService(this.tableRepo);
+    
+    // Khởi tạo an toàn cho BomService
+    const BomServiceClass = typeof BomService !== 'undefined' ? BomService : (typeof BOMService !== 'undefined' ? BOMService : null);
+    this.bomService = BomServiceClass ? new BomServiceClass(this.tableRepo) : null;
   }
 
   /**

@@ -19,12 +19,13 @@ function onOpen() {
 
     .addSeparator()
 
-    // NHÓM 3: QUẢN LÝ MAP_RULE & SKU
+    // NHÓM 3: QUẢN LÝ MAP_RULE & SKU (ĐÃ CẢI TIẾN LƯỢC ĐỒ NGỮ CẢNH)
     .addSubMenu(ui.createMenu("🛠️ 3. Quản lý MAP_RULE & SKU")
-      .addItem("1. Gợi ý tên chuẩn (AUTO_MAP_RULE)", "UI_applyAutoMapNamesAll")
+      .addItem("1. Gợi ý Tên chuẩn theo Ngữ cảnh (AUTO_MAP_RULE)", "UI_applyAutoMapNamesAll")
       .addItem("2. Sinh mã SKU & Đồng bộ ITEM_MASTER", "UI_generateAndSyncItemCodes")
+      .addItem("3. Đồng bộ tên/mã chuẩn sang Staging", "UI_syncMapRulesToStagingAll")
       .addSeparator()
-      .addItem("3. Đồng bộ tên/mã chuẩn sang Staging", "UI_syncMapRulesToStagingAll"))
+      .addItem("🚀 [1-Click] Chạy Toàn bộ Pipeline Map -> SKU -> Staging", "UI_runFullMappingPipeline"))
 
     // NHÓM 4: CHUẨN HÓA MASTER DATA (UC & INVENTORY SKU)
     .addSubMenu(ui.createMenu("📦 4. Chuẩn hóa Master Data")
@@ -33,11 +34,13 @@ function onOpen() {
 
     .addSeparator()
 
-    // NHÓM 5: TỔNG HỢP FACT DATA & RECALCULATE
-    .addSubMenu(ui.createMenu("📊 5. Tổng hợp Fact Data")
-      .addItem("Tổng hợp Fact Inbound (Nhập kho)...", "UI_promptAndRunFactInbound")
-      .addItem("Tổng hợp Fact Outbound (Tiêu hao & Food Cost)...", "UI_promptAndRunFactOutbound")
-      .addItem("Chạy toàn bộ Fact theo kỳ...", "UI_promptAndRunAllFact")
+    // NHÓM 5: ĐỊNH MỨC BOM & TỔNG HỢP FACT (COGS)
+    .addSubMenu(ui.createMenu("📊 5. Định mức BOM & Fact Data (COGS)")
+      .addItem("1. Khởi tạo / Cập nhật Danh mục BOM (BOM_RECIPE)", "UI_bootstrapBomRecipe")
+      .addItem("2. Tổng hợp Fact Inbound (Nhập kho)...", "UI_promptAndRunFactInbound")
+      .addItem("3. Tổng hợp Fact Outbound (Bung BOM & Food Cost)...", "UI_promptAndRunFactOutbound")
+      .addSeparator()
+      .addItem("🚀 [1-Click] Chạy Toàn bộ Pipeline BOM & Fact theo kỳ...", "UI_promptAndRunAllFact")
       .addSeparator()
       .addItem("🔄 [Cập nhật lại UC] PO -> Fact Inbound", "UI_recalculateFactPO")
       .addItem("🔄 [Cập nhật lại UC] SO -> Fact Outbound", "UI_recalculateFactSO"))
@@ -48,7 +51,7 @@ function onOpen() {
 }
 
 // ==========================================
-// HELPER FACTORY
+// HELPER FACTORIES
 // ==========================================
 
 function _getStagingService() {
@@ -56,6 +59,13 @@ function _getStagingService() {
   const schemaService = new SchemaService(tableRepo);
   const sysConfigService = new SysConfigService(tableRepo);
   return new DataStagingService(tableRepo, schemaService, sysConfigService);
+}
+
+function _getFactController() {
+  const tableRepo = new TableRepository();
+  const schemaService = new SchemaService(tableRepo);
+  const sysConfigService = new SysConfigService(tableRepo);
+  return new FactController(tableRepo, schemaService, sysConfigService);
 }
 
 // ==========================================
@@ -88,24 +98,26 @@ function promptAndRunIngestion(sourceType) {
 // ==========================================
 
 /**
- * Thao tác 3.1: Quét RAW nạp mặt hàng mới & Gợi ý tên chuẩn từ AUTO_MAP_RULE
+ * Thao tác 3.1: Quét RAW nạp mặt hàng mới & Gợi ý tên chuẩn theo Ngữ cảnh (PO, SO, OPENING)
  */
 function UI_applyAutoMapNamesAll() {
   const ui = SpreadsheetApp.getUi();
   try {
-    SpreadsheetApp.getActiveSpreadsheet().toast("Đang tự động nạp RAW và gợi ý tên chuẩn cho PO & SO...", "Hệ Thống", 5);
+    SpreadsheetApp.getActiveSpreadsheet().toast("Đang phân tích bối cảnh & gợi ý tên chuẩn cho PO, SO, OPENING...", "Hệ Thống", 5);
     const stagingService = _getStagingService();
     
     const countPO = stagingService.applyAutoMapNamesToMapRules("PO", true);
     const countSO = stagingService.applyAutoMapNamesToMapRules("SO", true);
-    const total = countPO + countSO;
+    const countOp = stagingService.applyAutoMapNamesToMapRules("OPENING", true);
+    const total = countPO + countSO + countOp;
 
     ui.alert(
-      "Hoàn tất Gợi ý Tên chuẩn!", 
-      `• Đã quét RAW & gợi ý tên chuẩn (item_name) cho ${total} dòng trên MAP_RULE.\n` +
-      `  - PO: ${countPO} dòng\n` +
-      `  - SO: ${countSO} dòng\n\n` +
-      `👉 Bạn có thể kiểm tra/sửa trực tiếp cột [item_name] trên Sheet MAP_RULE trước khi bấm Sinh mã SKU.`, 
+      "Hoàn tất Gợi ý Tên chuẩn theo Ngữ cảnh!", 
+      `• Đã gợi ý tên chuẩn (item_name) cho ${total} dòng trên MAP_RULE:\n` +
+      `  - PO (Hóa đơn mua): ${countPO} dòng\n` +
+      `  - SO (Hóa đơn bán): ${countSO} dòng\n` +
+      `  - OPENING (Tồn kho): ${countOp} dòng\n\n` +
+      `👉 Lưu ý: Nguồn OPENING đã được xử lý theo cơ chế cách ly Rule Chi phí/MST.`, 
       ui.ButtonSet.OK
     );
   } catch (error) {
@@ -161,13 +173,44 @@ function UI_syncMapRulesToStagingAll() {
   }
 }
 
+/**
+ * Thao tác 3.4: Tích hợp 1-Click tự động chạy toàn bộ quy trình Mapping
+ */
+function UI_runFullMappingPipeline() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    SpreadsheetApp.getActiveSpreadsheet().toast("🚀 Đang chạy chuỗi Auto-Map -> SKU -> Đồng bộ Staging...", "Hệ Thống", 10);
+    const stagingService = _getStagingService();
+
+    // Bước 1: Auto-map theo bối cảnh
+    const countPO = stagingService.applyAutoMapNamesToMapRules("PO", true);
+    const countSO = stagingService.applyAutoMapNamesToMapRules("SO", true);
+    const countOp = stagingService.applyAutoMapNamesToMapRules("OPENING", true);
+
+    // Bước 2: Sinh mã SKU
+    const newSkuCount = stagingService.generateAndSyncItemCodes();
+
+    // Bước 3: Đẩy sang Staging
+    const stgPO = stagingService.updateStagingMappedFields("PO");
+    const stgSO = stagingService.updateStagingMappedFields("SO");
+    const stgOp = stagingService.updateStagingMappedFields("OPENING");
+
+    ui.alert(
+      "🚀 Hoàn tất Pipeline Chuẩn hóa Mapping!", 
+      `1. Auto Map: Gợi ý ${countPO + countSO + countOp} dòng (PO: ${countPO}, SO: ${countSO}, OPENING: ${countOp})\n` +
+      `2. SKU Master: Sinh mới ${newSkuCount} mã SKU.\n` +
+      `3. Staging Sync: Đã cập nhật sang Staging (PO: ${stgPO}, SO: ${stgSO}, OPENING: ${stgOp}).`, 
+      ui.ButtonSet.OK
+    );
+  } catch (error) {
+    ui.alert("Lỗi Pipeline!", `Lỗi thực thi: ${error.message}`, ui.ButtonSet.OK);
+  }
+}
+
 // ==========================================
 // 3. CHUẨN HÓA MASTER DATA (UC & INVENTORY SKU)
 // ==========================================
 
-/**
- * Thao tác 4.1: Trích xuất các cặp đơn vị lẻ từ Staging sang UNIT_CONVERSION
- */
 function UI_bootstrapUnitConversion() {
   const ui = SpreadsheetApp.getUi();
   try {
@@ -186,9 +229,6 @@ function UI_bootstrapUnitConversion() {
   }
 }
 
-/**
- * Thao tác 4.2: Tự động gán mã Nguyên liệu (inventory_sku) cho ITEM_MASTER
- */
 function UI_applyAutoSkuRules() {
   const ui = SpreadsheetApp.getUi();
   const response = ui.alert(
@@ -214,18 +254,124 @@ function UI_applyAutoSkuRules() {
 }
 
 // ==========================================
-// 4. FACT & RECALCULATE ENTRY POINTS
+// 4. BOM & FACT ENTRY POINTS (COGS)
 // ==========================================
+
+/**
+ * Thao tác 5.1: Khởi tạo/Trích xuất cây định mức BOM từ ITEM_MASTER
+ */
+function UI_bootstrapBomRecipe() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    SpreadsheetApp.getActiveSpreadsheet().toast("Đang đồng bộ danh mục BOM từ ITEM_MASTER...", "Hệ Thống", 5);
+    
+    const tableRepo = new TableRepository();
+    const bomService = new BomService(tableRepo);
+    const addedCount = bomService.bootstrapBomFromItemMaster();
+
+    if (addedCount > 0) {
+      ui.alert(
+        "Thành công", 
+        `• Đã trích xuất và khởi tạo thành công ${addedCount} công thức/món mới vào BOM_RECIPE.`, 
+        ui.ButtonSet.OK
+      );
+    } else {
+      ui.alert(
+        "Thông báo", 
+        "Tất cả món bán và nguyên liệu đã có sẵn trong bảng BOM_RECIPE, không có dòng mới nào cần tạo.", 
+        ui.ButtonSet.OK
+      );
+    }
+  } catch (error) {
+    ui.alert("Lỗi hệ thống", `Không thể khởi tạo danh mục BOM: ${error.message}`, ui.ButtonSet.OK);
+  }
+}
+
+/**
+ * Thao tác 5.2: Tổng hợp Fact Inbound từ Staging PO
+ */
+function UI_promptAndRunFactInbound() {
+  const period = _promptForPeriod("Tổng hợp Fact Inbound (Nhập kho)");
+  if (period !== false) {
+    try {
+      SpreadsheetApp.getActiveSpreadsheet().toast("Đang tính toán Fact Inbound...", "Hệ Thống", 5);
+      const controller = _getFactController();
+      const count = controller.runFactInbound(period);
+      
+      SpreadsheetApp.getUi().alert(
+        "Thành công", 
+        `Đã xử lý & ghi thành công ${count} dòng vào bảng FACT_INBOUND (Kỳ: ${period || "TẤT CẢ"}).`, 
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    } catch (error) {
+      SpreadsheetApp.getUi().alert("Lỗi!", `Không thể tính Fact Inbound: ${error.message}`, SpreadsheetApp.getUi().ButtonSet.OK);
+    }
+  }
+}
+
+/**
+ * Thao tác 5.3: Tổng hợp Fact Outbound (Bung đệ quy BOM & tính Food Cost)
+ */
+function UI_promptAndRunFactOutbound() {
+  const period = _promptForPeriod("Tổng hợp Fact Outbound (Tiêu hao & Food Cost)");
+  if (period !== false) {
+    try {
+      SpreadsheetApp.getActiveSpreadsheet().toast("Đang xả BOM đệ quy & tính toán Food Cost...", "Hệ Thống", 5);
+      const controller = _getFactController();
+      const count = controller.runFactOutbound(period);
+      
+      SpreadsheetApp.getUi().alert(
+        "Thành công", 
+        `Đã bung đệ quy BOM & ghi ${count} dòng chi tiết tiêu hao vào FACT_OUTBOUND (Kỳ: ${period || "TẤT CẢ"}).`, 
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    } catch (error) {
+      SpreadsheetApp.getUi().alert("Lỗi!", `Không thể tính Fact Outbound: ${error.message}`, SpreadsheetApp.getUi().ButtonSet.OK);
+    }
+  }
+}
+
+/**
+ * Thao tác 5.4: [1-Click] Chạy toàn bộ chuỗi BOM & Fact (Inbound -> Outbound -> COGS)
+ */
+function UI_promptAndRunAllFact() {
+  const period = _promptForPeriod("🚀 [1-Click] Chạy Toàn bộ Pipeline BOM & Fact Data");
+  if (period !== false) {
+    try {
+      SpreadsheetApp.getActiveSpreadsheet().toast("🚀 Đang chạy chuỗi Pipeline Fact Inbound -> BOM -> Fact Outbound...", "Hệ Thống", 10);
+      
+      const tableRepo = new TableRepository();
+      const bomService = new BomService(tableRepo);
+      const controller = _getFactController();
+
+      // 1. Bootstrap BOM
+      const newBomCount = bomService.bootstrapBomFromItemMaster();
+
+      // 2. Fact Inbound & Outbound
+      const res = controller.runAllFact(period);
+
+      SpreadsheetApp.getUi().alert(
+        "🚀 Hoàn tất Pipeline Fact & COGS!", 
+        `Kết quả tổng hợp (Kỳ: ${period || "TẤT CẢ"}):\n` +
+        `• BOM Recipe mới: ${newBomCount} công thức\n` +
+        `• Fact Inbound (Nhập kho): ${res.countInbound} dòng\n` +
+        `• Fact Outbound (Bung BOM & Food Cost): ${res.countOutbound} dòng`, 
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    } catch (error) {
+      SpreadsheetApp.getUi().alert("Lỗi Pipeline!", `Lỗi thực thi Fact Pipeline: ${error.message}`, SpreadsheetApp.getUi().ButtonSet.OK);
+    }
+  }
+}
 
 function UI_recalculateFactPO() { _executeRecalculateFact("PO"); }
 function UI_recalculateFactSO() { _executeRecalculateFact("SO"); }
 
 function _executeRecalculateFact(sourceGroup) {
-  const controller = new FactController();
   const ui = SpreadsheetApp.getUi();
-
   try {
     SpreadsheetApp.getActiveSpreadsheet().toast("Đang cập nhật lại quy đổi đơn vị sang Fact...", "Hệ Thống", 5);
+    const controller = _getFactController();
     const count = controller.recalculateOnUnitConversionChange(sourceGroup);
 
     ui.alert(
@@ -236,39 +382,6 @@ function _executeRecalculateFact(sourceGroup) {
     );
   } catch (error) {
     ui.alert("Lỗi!", `Không thể tính lại Fact cho ${sourceGroup}: ${error.message}`, ui.ButtonSet.OK);
-  }
-}
-
-function UI_promptAndRunFactInbound() {
-  const period = _promptForPeriod("Tổng hợp Fact Inbound");
-  if (period !== false) {
-    const controller = new FactController();
-    const count = controller.runFactInbound(period);
-    SpreadsheetApp.getUi().alert(`Đã tổng hợp ${count} dòng Fact Inbound (Kỳ: ${period || "ALL"})!`);
-  }
-}
-
-function UI_promptAndRunFactOutbound() {
-  const period = _promptForPeriod("Tổng hợp Fact Outbound");
-  if (period !== false) {
-    const controller = new FactController();
-    const count = controller.runFactOutbound(period);
-    SpreadsheetApp.getUi().alert(`Đã tổng hợp ${count} dòng Fact Outbound (Kỳ: ${period || "ALL"})!`);
-  }
-}
-
-function UI_promptAndRunAllFact() {
-  const period = _promptForPeriod("Tổng hợp Toàn bộ Fact");
-  if (period !== false) {
-    const controller = new FactController();
-    const res = controller.runAllFact(period);
-    SpreadsheetApp.getUi().alert(
-      "Hoàn tất!", 
-      `Kết quả tổng hợp Fact (Kỳ: ${period || "ALL"}):\n` +
-      `- Fact Inbound: ${res.countInbound} dòng\n` +
-      `- Fact Outbound: ${res.countOutbound} dòng`, 
-      SpreadsheetApp.getUi().ButtonSet.OK
-    );
   }
 }
 
