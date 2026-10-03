@@ -1,17 +1,27 @@
 /**
- * [SERVICE] BomService.js - Optimized with In-Memory Cache
+ * [SERVICE] BomService.js - Dynamic Schema V2 (Empty Child Item Code on Bootstrap)
  */
 class BomService {
-  constructor(tableRepo, configService = null) {
+  constructor(tableRepo, schemaService, configService = null) {
+    if (!tableRepo || !schemaService) {
+      throw new Error("[BomService] Thieu Dependency bat buoc (tableRepo, schemaService).");
+    }
     this.tableRepo = tableRepo;
+    this.schemaService = schemaService;
     this.configService = configService;
     this.KEY_DELIMITER = "___";
-    this._cachedBomMap = null; // Cache map để không re-query Sheet liên tục
+    this._cachedBomMap = null;
   }
 
-  _getColIdx(headerRow, colKey) {
-    if (!headerRow) return -1;
-    return headerRow.findIndex(cell => String(cell || "").trim().toLowerCase() === colKey.toLowerCase());
+  /**
+   * Lấy Col Index (0-based) chuẩn V2 từ SchemaService
+   */
+  _getColIndex(schemaName, colKey) {
+    const schemaMap = (typeof this.schemaService.getSchemaMap === 'function') 
+      ? this.schemaService.getSchemaMap() 
+      : null;
+    const col1Based = this.schemaService.getColIndex(schemaMap, schemaName, colKey);
+    return col1Based > 0 ? col1Based - 1 : -1;
   }
 
   _resolveTargetDate(timeInput) {
@@ -48,61 +58,121 @@ class BomService {
     return tTime >= fTime && tTime <= eTime;
   }
 
+  /**
+   * Khởi tạo danh mục BOM từ ITEM_MASTER
+   * - KHÔNG tự động điền child_item_code (để trống "")
+   */
   bootstrapBomFromItemMaster() {
-    this.clearCache(); // Reset cache khi bootstrap lại
+    this.clearCache();
     const imInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
     const imRows = imInfo ? imInfo.values : [];
     if (!imRows || imRows.length <= 1) return 0;
 
-    const imHeaders = imRows[0];
-    const idxItemCode = this._getColIdx(imHeaders, "item_code");
-    const idxInvSku  = this._getColIdx(imHeaders, "inventory_sku") !== -1 
-                        ? this._getColIdx(imHeaders, "inventory_sku") 
-                        : this._getColIdx(imHeaders, "inventory_code");
-    const idxUnit    = this._getColIdx(imHeaders, "base_unit");
+    // 1. Lấy tham số cấu hình lọc từ ConfigService
+    let allowedSourceGroups = [];
+    let nonInventoryTypes = [];
 
+    if (this.configService && typeof this.configService.getConfig === "function") {
+      const rawGroups = this.configService.getConfig("BOM_PARENT_SOURCE_GROUPS") || "SO,OUT";
+      allowedSourceGroups = rawGroups.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+
+      const rawNonInv = this.configService.getConfig("NON_INVENTORY_ITEM_TYPES") || "";
+      nonInventoryTypes = rawNonInv.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+    } else {
+      allowedSourceGroups = ["SO", "OUT"];
+    }
+
+    // 2. Xác định vị trí cột động trong ITEM_MASTER theo Schema
+    const idxItemCode   = this._getColIndex("ITEM_MASTER", "item_code");
+    const idxUnit       = this._getColIndex("ITEM_MASTER", "base_unit");
+    const idxSourceGrp  = this._getColIndex("ITEM_MASTER", "source_group");
+    const idxItemType   = this._getColIndex("ITEM_MASTER", "item_type");
+
+    // 3. Đọc dữ liệu BOM_RECIPE hiện tại để lấy danh sách PARENT đã tồn tại
     const bomInfo = this.tableRepo.getDataByTableName("BOM_RECIPE");
     const bomRows = bomInfo ? bomInfo.values : [];
-    const existingPairs = new Set();
+    const existingParents = new Set();
 
     if (bomRows && bomRows.length > 1) {
-      const bomHeaders = bomRows[0];
-      const idxParent  = this._getColIdx(bomHeaders, "parent_item_code");
-      const idxChild   = this._getColIdx(bomHeaders, "child_item_code");
+      const idxParent = this._getColIndex("BOM_RECIPE", "parent_item_code");
 
       for (let r = 1; r < bomRows.length; r++) {
-        const p = String(bomRows[r][idxParent] || "").trim();
-        const c = String(bomRows[r][idxChild] || "").trim();
-        if (p && c) {
-          existingPairs.add(`${p}${this.KEY_DELIMITER}${c}`);
-        }
+        const p = idxParent !== -1 ? String(bomRows[r][idxParent] || "").trim() : "";
+        if (p) existingParents.add(p);
       }
     }
 
     const newBomRows = [];
     const primaryKeys = ["parent_item_code", "child_item_code"];
 
-    for (let r = 1; r < imRows.length; r++) {
-      const parentCode = String(imRows[r][idxItemCode] || "").trim();
-      let childCode    = idxInvSku !== -1 ? String(imRows[r][idxInvSku] || "").trim() : "";
-      
-      if (!childCode) childCode = parentCode;
-      if (!parentCode || !childCode) continue;
+    // 4. Lấy Schema Definition của BOM_RECIPE để chiếu dữ liệu động
+    const schemaMap = this.schemaService.getSchemaMap();
+    const bomSchema = schemaMap["BOM_RECIPE"] || schemaMap["bom_recipe"];
+    const colDefs = bomSchema ? (bomSchema.columns || bomSchema) : {};
 
-      const pairKey = `${parentCode}${this.KEY_DELIMITER}${childCode}`;
-      if (!existingPairs.has(pairKey)) {
-        const unit = idxUnit !== -1 ? String(imRows[r][idxUnit] || "").trim().toLowerCase() : "";
-        
-        newBomRows.push([
-          parentCode, childCode, 1, unit, 1, true, "2026-01-01", "2099-12-31", true
-        ]);
-        existingPairs.add(pairKey);
+    for (let r = 1; r < imRows.length; r++) {
+      const parentCode = idxItemCode !== -1 ? String(imRows[r][idxItemCode] || "").trim() : "";
+      if (!parentCode) continue;
+
+      // QUY TẮC 1: Nếu mã Parent ĐÃ TỒN TẠI trong BOM_RECIPE -> BỎ QUA HOÀN TOÀN
+      if (existingParents.has(parentCode)) {
+        continue;
       }
+
+      // QUY TẮC 2: Loại bỏ mặt hàng dịch vụ / chi phí / không theo dõi tồn kho
+      const itemType = idxItemType !== -1 ? String(imRows[r][idxItemType] || "").trim().toUpperCase() : "";
+      if (itemType && nonInventoryTypes.includes(itemType)) {
+        continue;
+      }
+
+      // QUY TẮC 3: Kiểm tra nhóm nguồn thuộc BOM_PARENT_SOURCE_GROUPS
+      let sourceGroup = idxSourceGrp !== -1 ? String(imRows[r][idxSourceGrp] || "").trim().toUpperCase() : "";
+      if (!sourceGroup) {
+        const prefix = parentCode.split("_")[0];
+        sourceGroup = prefix ? prefix.toUpperCase() : "";
+      }
+
+      if (allowedSourceGroups.length > 0 && !allowedSourceGroups.includes(sourceGroup)) {
+        continue;
+      }
+
+      const unit = idxUnit !== -1 ? String(imRows[r][idxUnit] || "").trim().toLowerCase() : "";
+      
+      // QUY TẮC MỚI: child_item_code ĐỂ TRỐNG ""
+      const computedBomObj = {
+        "parent_item_code": parentCode,
+        "child_item_code": "", 
+        "std_qty": 1,
+        "unit": unit,
+        "bom_level": 1,
+        "is_leaf": true,
+        "effective_from": "2026-01-01",
+        "effective_to": "2099-12-31",
+        "is_active": false,
+        "note": "Auto bootstrap from ITEM_MASTER"
+      };
+
+      // Project mảng dòng dựa theo Schema Index thực tế
+      const projectedRow = [];
+      Object.keys(colDefs).forEach(colKey => {
+        const colInfo = colDefs[colKey];
+        const idxZeroBased = (typeof colInfo === 'object' && colInfo.col_index !== undefined)
+          ? Number(colInfo.col_index) - 1
+          : Number(colInfo) - 1;
+
+        if (idxZeroBased >= 0) {
+          const val = computedBomObj.hasOwnProperty(colKey) ? computedBomObj[colKey] : "";
+          projectedRow[idxZeroBased] = (val !== undefined && val !== null) ? val : "";
+        }
+      });
+
+      newBomRows.push(projectedRow);
+      existingParents.add(parentCode);
     }
 
     if (newBomRows.length > 0) {
       this.tableRepo.upsertRowsByTableName("BOM_RECIPE", newBomRows, primaryKeys);
-      Logger.log(`[BOM SERVICE] Đã khởi tạo mới ${newBomRows.length} bản ghi BOM vào BOM_RECIPE.`);
+      Logger.log(`[BOM SERVICE] Đã khởi tạo mới ${newBomRows.length} bản ghi BOM vào BOM_RECIPE (child_item_code để trống).`);
     }
 
     return newBomRows.length;
@@ -112,9 +182,6 @@ class BomService {
     this._cachedBomMap = null;
   }
 
-  /**
-   * Tải Map danh sách BOM hợp lệ - Có Cache In-Memory
-   */
   _loadEffectiveBomMap(targetDate) {
     if (this._cachedBomMap) {
       return this._cachedBomMap;
@@ -129,32 +196,33 @@ class BomService {
       return bomMap;
     }
 
-    const headers   = bomRows[0];
-    const idxParent = this._getColIdx(headers, "parent_item_code");
-    const idxChild  = this._getColIdx(headers, "child_item_code");
-    const idxQty    = this._getColIdx(headers, "std_qty");
-    const idxUnit   = this._getColIdx(headers, "unit");
-    const idxLevel  = this._getColIdx(headers, "bom_level");
-    const idxLeaf   = this._getColIdx(headers, "is_leaf");
-    const idxFrom   = this._getColIdx(headers, "effective_from");
-    const idxTo     = this._getColIdx(headers, "effective_to");
-    const idxActive = this._getColIdx(headers, "is_active");
+    const idxParent = this._getColIndex("BOM_RECIPE", "parent_item_code");
+    const idxChild  = this._getColIndex("BOM_RECIPE", "child_item_code");
+    const idxQty    = this._getColIndex("BOM_RECIPE", "std_qty");
+    const idxUnit   = this._getColIndex("BOM_RECIPE", "unit");
+    const idxLevel  = this._getColIndex("BOM_RECIPE", "bom_level");
+    const idxLeaf   = this._getColIndex("BOM_RECIPE", "is_leaf");
+    const idxFrom   = this._getColIndex("BOM_RECIPE", "effective_from");
+    const idxTo     = this._getColIndex("BOM_RECIPE", "effective_to");
+    const idxActive = this._getColIndex("BOM_RECIPE", "is_active");
 
     for (let r = 1; r < bomRows.length; r++) {
       const row = bomRows[r];
-      const parent = String(row[idxParent] || "").trim();
-      const child  = String(row[idxChild] || "").trim();
-      const qty    = Number(row[idxQty]) || 0;
-      const unit   = String(row[idxUnit] || "").trim();
+      const parent = idxParent !== -1 ? String(row[idxParent] || "").trim() : "";
+      const child  = idxChild !== -1 ? String(row[idxChild] || "").trim() : "";
+      const qty    = idxQty !== -1 ? (Number(row[idxQty]) || 0) : 0;
+      const unit   = idxUnit !== -1 ? String(row[idxUnit] || "").trim() : "";
       const level  = idxLevel !== -1 ? (Number(row[idxLevel]) || 1) : 1;
       
-      const strLeaf   = String(row[idxLeaf] || "").trim().toUpperCase();
-      const isLeaf    = strLeaf === "TRUE" || strLeaf === "1" || row[idxLeaf] === true;
+      const rawLeaf   = idxLeaf !== -1 ? row[idxLeaf] : true;
+      const strLeaf   = String(rawLeaf || "").trim().toUpperCase();
+      const isLeaf    = strLeaf === "TRUE" || strLeaf === "1" || rawLeaf === true;
       
-      const strActive = idxActive !== -1 ? String(row[idxActive] || "").trim().toUpperCase() : "TRUE";
-      const isActive  = strActive === "TRUE" || strActive === "1" || row[idxActive] === true;
+      const rawActive = idxActive !== -1 ? row[idxActive] : true;
+      const strActive = String(rawActive || "").trim().toUpperCase();
+      const isActive  = strActive === "TRUE" || strActive === "1" || rawActive === true;
 
-      if (!parent || !child || !isActive) continue;
+      if (!parent || !isActive) continue;
 
       const effFrom = idxFrom !== -1 ? row[idxFrom] : null;
       const effTo   = idxTo !== -1 ? row[idxTo] : null;
@@ -178,6 +246,14 @@ class BomService {
     return bomMap;
   }
 
+  getBomComponents(parentCode, targetTime = new Date()) {
+    const directRecipe = this.getDirectRecipe(parentCode, targetTime);
+    if (directRecipe && directRecipe.length > 0) {
+      return directRecipe;
+    }
+    return this.explodeBom(parentCode, 1, targetTime);
+  }
+
   explodeBom(parentCode, parentQty = 1, targetTime = new Date()) {
     const targetDate = this._resolveTargetDate(targetTime);
     const bomMap = this._loadEffectiveBomMap(targetDate);
@@ -189,6 +265,8 @@ class BomService {
       if (children.length === 0) return;
 
       for (const child of children) {
+        if (!child.childItemCode) continue;
+
         const reqQty = currentQty * child.stdQty;
 
         if (child.isLeaf || !bomMap.has(child.childItemCode)) {
@@ -220,7 +298,7 @@ class BomService {
     const cleanParent = String(parentCode || "").trim();
     const children = bomMap.get(cleanParent) || [];
 
-    return children.map(c => ({
+    return children.filter(c => Boolean(c.childItemCode)).map(c => ({
       parentItemCode: cleanParent,
       childItemCode: c.childItemCode,
       child_item_code: c.childItemCode,

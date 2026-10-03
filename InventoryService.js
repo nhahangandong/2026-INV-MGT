@@ -1,238 +1,334 @@
 /**
  * [SERVICE] InventoryService
- * Tính toán Tồn kho Đầu kỳ, Nhập, Xuất và Tồn kho Cuối kỳ theo từng kỳ báo cáo
+ * Tính toán báo cáo Xuất - Nhập - Tồn (FACT_INVENTORY_BALANCE)
+ * Áp dụng cơ chế cuộn số dư chuyển tiếp kỳ N-1 -> N và Đơn giá Bình quân Gia quyền
  */
 class InventoryService {
   constructor(tableRepo, schemaService) {
     this.tableRepo = tableRepo;
     this.schemaService = schemaService;
+    this.schemaName = "FACT_INVENTORY_BALANCE";
   }
 
   /**
-   * TỔNG HỢP BẢNG TỒN KHO THEO KỲ (FACT_INVENTORY_BALANCE)
-   * @param {Array<string>} periodsList - Danh sách các kỳ cần tính theo thứ tự (vd: ["2026-01", "2026-02"])
+   * Tính toán và ghi nhận báo cáo N-X-T vào FACT_INVENTORY_BALANCE
+   * @param {Array<string>|string|null} targetPeriods Danh sách kỳ cần lấy kết quả ghi (Ví dụ: ['202609'] hoặc null nếu ghi toàn bộ)
    */
-  calculatePeriodicInventory(periodsList = []) {
-    Logger.log("[INVENTORY] Bắt đầu tính toán tổng hợp tồn kho theo kỳ...");
+  calculatePeriodicInventory(targetPeriods) {
+    // 0. Khởi tạo schemaMap một lần duy nhất từ SchemaService
+    const schemaMap = this.schemaService ? this.schemaService.getSchemaMap() : null;
 
-    // 1. Lấy dữ liệu Tồn kho Ban đầu (Opening)
-    const openingMap = this._loadOpeningBalance();
-
-    // 2. Lấy dữ liệu Fact Inbound & Outbound
-    const inboundData = this._loadFactInbound();
-    const outboundData = this._loadFactOutbound();
-
-    // Lấy tất cả các kỳ nếu không truyền tham số
-    if (!periodsList || periodsList.length === 0) {
-      const allPeriods = new Set([
-        ...Object.keys(inboundData),
-        ...Object.keys(outboundData)
-      ]);
-      periodsList = Array.from(allPeriods).sort();
+    // Standardize targetPeriods
+    let filterPeriods = null;
+    if (targetPeriods) {
+      if (Array.isArray(targetPeriods)) {
+        filterPeriods = targetPeriods.map(p => this._normalizePeriod(p)).filter(Boolean);
+      } else if (typeof targetPeriods === 'string' && targetPeriods.trim()) {
+        filterPeriods = [this._normalizePeriod(targetPeriods)];
+      }
     }
 
-    // Map theo dõi số dư lũy kế qua từng kỳ: { ingredient_code: { qty, amount } }
-    let runningBalance = { ...openingMap };
+    // 1. Load toàn bộ dữ liệu từ các nguồn
+    const stgOpening = this._loadStgOpening(schemaMap);
+    const inboundData = this._loadFactInbound(schemaMap);
+    const outboundData = this._loadFactOutbound(schemaMap);
 
-    const balanceRows = [];
+    // 2. Gom tất cả danh sách các Kỳ xuất hiện trong hệ thống và sắp xếp tăng dần
+    const allPeriodsSet = new Set(['202601']); // Kỳ đầu tiên mặc định từ STG_INVENTORY_OPENING
+    Object.keys(inboundData).forEach(p => allPeriodsSet.add(p));
+    Object.keys(outboundData).forEach(p => allPeriodsSet.add(p));
+    if (filterPeriods) {
+      filterPeriods.forEach(p => allPeriodsSet.add(p));
+    }
 
-    // 3. Duyệt qua từng kỳ theo thứ tự thời gian
-    periodsList.forEach(period => {
-      const inCurrentPeriod = inboundData[period] || {};
-      const outCurrentPeriod = outboundData[period] || {};
+    const sortedPeriods = Array.from(allPeriodsSet).sort();
 
-      // Tập hợp tất cả các mã NVL phát sinh hoặc có tồn kho
-      const allIngrCodes = new Set([
-        ...Object.keys(runningBalance),
-        ...Object.keys(inCurrentPeriod),
-        ...Object.keys(outCurrentPeriod)
-      ]);
+    // 3. Gom tất cả các SKU xuất hiện ở bất kỳ nguồn nào
+    const allSkusSet = new Set();
+    Object.keys(stgOpening).forEach(sku => allSkusSet.add(sku));
+    Object.values(inboundData).forEach(p => Object.keys(p).forEach(sku => allSkusSet.add(sku)));
+    Object.values(outboundData).forEach(p => Object.keys(p).forEach(sku => allSkusSet.add(sku)));
 
-      allIngrCodes.forEach(ingrCode => {
-        // A. Đầu kỳ = Cuối kỳ trước (hoặc Opening Ban đầu)
-        const openQty = runningBalance[ingrCode] ? runningBalance[ingrCode].qty : 0;
-        const openAmt = runningBalance[ingrCode] ? runningBalance[ingrCode].amount : 0;
+    // Biến lưu số dư lũy kế chuyển tiếp: { SKU: { qty, amt, avgCost } }
+    const runningBalance = {};
 
-        // B. Nhập trong kỳ
-        const inQty = inCurrentPeriod[ingrCode] ? inCurrentPeriod[ingrCode].qty : 0;
-        const inAmt = inCurrentPeriod[ingrCode] ? inCurrentPeriod[ingrCode].amt : 0;
+    // Khởi tạo runningBalance ban đầu (Kỳ đầu tiên)
+    for (const sku of allSkusSet) {
+      const init = stgOpening[sku] || { qty: 0, amt: 0 };
+      runningBalance[sku] = {
+        qty: init.qty,
+        amt: init.amt,
+        avgCost: init.qty > 0 ? (init.amt / init.qty) : 0
+      };
+    }
 
-        // C. Đơn giá bình quân khả dụng trong kỳ (Weighted Avg Cost)
-        const totalAvailQty = openQty + inQty;
-        const totalAvailAmt = openAmt + inAmt;
-        const avgUnitCost = totalAvailQty > 0 ? totalAvailAmt / totalAvailQty : 0;
+    const calculatedRowsByPeriod = {};
 
-        // D. Xuất trong kỳ
-        const outQty = outCurrentPeriod[ingrCode] ? outCurrentPeriod[ingrCode].qty : 0;
-        const outAmt = outQty * avgUnitCost; // Tính theo đơn giá bình quân
+    // 4. Lặp qua từng kỳ theo thứ tự thời gian để lũy kế số dư
+    for (const p of sortedPeriods) {
+      const currentInbound = inboundData[p] || {};
+      const currentOutbound = outboundData[p] || {};
+      const periodRows = [];
 
-        // E. Tồn cuối kỳ
+      for (const sku of allSkusSet) {
+        // Tồn đầu kỳ N = Tồn cuối kỳ N-1 (từ runningBalance)
+        const openQty = runningBalance[sku].qty;
+        const openAmt = runningBalance[sku].amt;
+
+        // Phát sinh Nhập/Xuất trong kỳ N
+        const inQty = currentInbound[sku] ? currentInbound[sku].qty : 0;
+        const inAmt = currentInbound[sku] ? currentInbound[sku].amt : 0;
+
+        const outQty = currentOutbound[sku] ? currentOutbound[sku].qty : 0;
+
+        // Tính Đơn giá bình quân gia quyền cho kỳ N
+        const totalQtyForAvg = openQty + inQty;
+        const totalAmtForAvg = openAmt + inAmt;
+        
+        let avgUnitCost = runningBalance[sku].avgCost;
+        if (totalQtyForAvg > 0) {
+          avgUnitCost = totalAmtForAvg / totalQtyForAvg;
+        }
+
+        // Giá trị xuất kho = Số lượng xuất * Đơn giá bình quân
+        const outAmt = outQty * avgUnitCost;
+
+        // Tính Tồn cuối kỳ N
         const closeQty = openQty + inQty - outQty;
-        const closeAmt = closeQty * avgUnitCost;
+        const closeAmt = openAmt + inAmt - outAmt;
 
-        // Lưu bản ghi kết quả
-        balanceRows.push([
-          period,
-          ingrCode,
-          openQty,
-          openAmt,
-          inQty,
-          inAmt,
-          outQty,
-          outAmt,
-          closeQty,
-          avgUnitCost,
-          closeAmt
-        ]);
-
-        // Cập nhật Số dư lũy kế cho kỳ tiếp theo
-        runningBalance[ingrCode] = {
+        // Cập nhật runningBalance cho kỳ N+1
+        runningBalance[sku] = {
           qty: closeQty,
-          amount: closeAmt
+          amt: closeAmt,
+          avgCost: avgUnitCost
         };
-      });
-    });
 
-    // 4. Lưu vào bảng FACT_INVENTORY_BALANCE
-    if (balanceRows.length > 0) {
-      this.tableRepo.upsertRowsByTableName("FACT_INVENTORY_BALANCE", balanceRows, ["period", "ingredient_code"]);
-      Logger.log(`[INVENTORY] Đã cập nhật ${balanceRows.length} dòng vào FACT_INVENTORY_BALANCE.`);
+        // Bỏ qua các dòng không có số dư và không có phát sinh trong kỳ
+        if (openQty !== 0 || openAmt !== 0 || inQty !== 0 || inAmt !== 0 || outQty !== 0 || closeQty !== 0) {
+          periodRows.push([
+            p,                // period
+            sku,              // inventory_sku
+            openQty,          // opening_qty
+            openAmt,          // opening_amount
+            inQty,            // inbound_qty
+            inAmt,            // inbound_amount
+            outQty,           // outbound_qty
+            outAmt,           // outbound_amount
+            closeQty,         // closing_qty
+            avgUnitCost,      // avg_unit_cost
+            closeAmt          // closing_amount
+          ]);
+        }
+      }
+
+      calculatedRowsByPeriod[p] = periodRows;
     }
 
-    return balanceRows.length;
+    // 5. Ghi dữ liệu vào FACT_INVENTORY_BALANCE
+    return this._saveToFactTable(calculatedRowsByPeriod, filterPeriods, schemaMap);
   }
 
-
-
-  
   /**
-   * Cập nhật hàm _loadOpeningBalance trong InventoryService.js
+   * Helper tra cứu dữ liệu từ TableRepository theo schemaName
    */
-  _loadOpeningBalance() {
-    // 1. Lấy bảng kiểm kê thô STG_INVENTORY_OPENING
-    const stgTable = this.tableRepo.getDataByTableName("STG_INVENTORY_OPENING");
-    const stgRows = stgTable ? stgTable.values : [];
-  
-    // 2. Load Mapping từ ITEM_MASTER (item_code -> ingredient_code & conversion_factor)
-    const imTable = this.tableRepo.getDataByTableName("ITEM_MASTER");
-    const imRows = imTable ? imTable.values : [];
-    const itemMap = {};
-
-    if (imRows && imRows.length > 1) {
-      const codeIdx   = this._getColIndex("ITEM_MASTER", "item_code");
-      const ingrIdx   = this._getColIndex("ITEM_MASTER", "ingredient_code");
-      const factorIdx = this._getColIndex("ITEM_MASTER", "conversion_factor");
-
-      for (let i = 1; i < imRows.length; i++) {
-        const c   = String(imRows[i][codeIdx] || "").trim();
-        const ing = String(imRows[i][ingrIdx] || "").trim();
-        const f   = Number(imRows[i][factorIdx]) || 1;
-        if (c) {
-          itemMap[c] = {
-            ingredient_code: ing || c, // Fallback về chính item_code nếu chưa set
-            conversion_factor: f
-          };
-        }
-      }
+  _getTableData(schemaName) {
+    if (!this.tableRepo) return null;
+    try {
+      return this.tableRepo.getDataByTableName(schemaName);
+    } catch (e) {
+      return null;
     }
-
-    const openingMap = {}; // Tổng hợp lại theo ingredient_code
-
-    if (stgRows && stgRows.length > 1) {
-      const itemCodeIdx = this._getColIndex("STG_INVENTORY_OPENING", "item_code");
-      const qtyIdx      = this._getColIndex("STG_INVENTORY_OPENING", "quantity");
-      const costIdx     = this._getColIndex("STG_INVENTORY_OPENING", "unit_cost");
-      const amtIdx      = this._getColIndex("STG_INVENTORY_OPENING", "amount");
-
-      for (let i = 1; i < stgRows.length; i++) {
-        const rawItemCode = String(stgRows[i][itemCodeIdx] || "").trim();
-        const rawQty      = Number(stgRows[i][qtyIdx]) || 0;
-        const rawCost     = Number(stgRows[i][costIdx]) || 0;
-        const rawAmt      = Number(stgRows[i][amtIdx]) || (rawQty * rawCost);
-
-        if (!rawItemCode) continue;
-
-        // Quy đổi sang ingredient_code và base_qty
-        const mappingInfo = itemMap[rawItemCode] || { ingredient_code: rawItemCode, conversion_factor: 1 };
-        const ingrCode    = mappingInfo.ingredient_code;
-        const factor      = mappingInfo.conversion_factor || 1;
-
-        const baseQty = rawQty * factor;
-        const baseAmt = rawAmt; // Thành tiền giữ nguyên
-
-        // Gom nhóm lũy kế nếu nhiều mã INT_... cùng thuộc 1 ING_...
-        if (!openingMap[ingrCode]) {
-          openingMap[ingrCode] = { qty: 0, amount: 0 };
-        }
-        openingMap[ingrCode].qty += baseQty;
-        openingMap[ingrCode].amount += baseAmt;
-      }
-    }
-
-    return openingMap;
   }
 
-  _loadFactInbound() {
-    const table = this.tableRepo.getDataByTableName("FACT_INBOUND");
-    const rows = table ? table.values : [];
-    const result = {}; // { period: { ingrCode: { qty, amt } } }
+  /**
+   * Đọc dữ liệu Tồn đầu kỳ từ STG_INVENTORY_OPENING (Kỳ 202601)
+   */
+  _loadStgOpening(schemaMap) {
+    const itemMasterMap = this._loadItemMasterSkuMap(schemaMap);
+
+    const table = this._getTableData("STG_INVENTORY_OPENING");
+    const rows  = table ? table.values : [];
+    const result = {}; // { inventory_sku: { qty, amt } }
 
     if (rows && rows.length > 1) {
-      const pIdx   = this._getColIndex("FACT_INBOUND", "period");
-      const ingIdx = this._getColIndex("FACT_INBOUND", "ingredient_code");
-      const qtyIdx = this._getColIndex("FACT_INBOUND", "base_qty");
-      const amtIdx = this._getColIndex("FACT_INBOUND", "amount");
+      const itemCodeIdx = this._getColIndex(schemaMap, "STG_INVENTORY_OPENING", "item_code");
+      const qtyIdx      = this._getColIndex(schemaMap, "STG_INVENTORY_OPENING", "quantity");
+      const amtIdx      = this._getColIndex(schemaMap, "STG_INVENTORY_OPENING", "amount");
 
       for (let i = 1; i < rows.length; i++) {
-        const p   = String(rows[i][pIdx] || "").trim();
-        const ing = String(rows[i][ingIdx] || "").trim();
-        const q   = Number(rows[i][qtyIdx]) || 0;
-        const a   = Number(rows[i][amtIdx]) || 0;
+        const itemCode = itemCodeIdx !== -1 ? String(rows[i][itemCodeIdx] || "").trim() : "";
+        const q        = qtyIdx !== -1 ? Number(rows[i][qtyIdx]) || 0 : 0;
+        const a        = amtIdx !== -1 ? Number(rows[i][amtIdx]) || 0 : 0;
 
-        if (p && ing) {
-          if (!result[p]) result[p] = {};
-          if (!result[p][ing]) result[p][ing] = { qty: 0, amt: 0 };
-          result[p][ing].qty += q;
-          result[p][ing].amt += a;
+        if (itemCode) {
+          const sku = itemMasterMap[itemCode] || itemCode;
+
+          if (!result[sku]) result[sku] = { qty: 0, amt: 0 };
+          result[sku].qty += q;
+          result[sku].amt += a;
         }
       }
     }
     return result;
   }
 
-  _loadFactOutbound() {
-    const table = this.tableRepo.getDataByTableName("FACT_OUTBOUND");
-    const rows = table ? table.values : [];
-    const result = {}; // { period: { ingrCode: { qty } } }
+  /**
+   * Helper tải bảng ITEM_MASTER để lập bản đồ ánh xạ item_code -> inventory_sku
+   */
+  _loadItemMasterSkuMap(schemaMap) {
+    const table = this._getTableData("ITEM_MASTER");
+    const rows  = table ? table.values : [];
+    const skuMap = {}; // { item_code: inventory_sku }
 
     if (rows && rows.length > 1) {
-      const pIdx   = this._getColIndex("FACT_OUTBOUND", "period");
-      const ingIdx = this._getColIndex("FACT_OUTBOUND", "ingredient_code");
-      const qtyIdx = this._getColIndex("FACT_OUTBOUND", "consumed_qty");
+      const itemCodeIdx = this._getColIndex(schemaMap, "ITEM_MASTER", "item_code");
+      const invSkuIdx   = this._getColIndex(schemaMap, "ITEM_MASTER", "inventory_sku");
+
+      if (itemCodeIdx !== -1 && invSkuIdx !== -1) {
+        for (let i = 1; i < rows.length; i++) {
+          const itemCode = String(rows[i][itemCodeIdx] || "").trim();
+          const invSku   = String(rows[i][invSkuIdx] || "").trim();
+
+          if (itemCode && invSku) {
+            skuMap[itemCode] = invSku;
+          }
+        }
+      }
+    }
+    return skuMap;
+  }
+
+  /**
+   * Đọc dữ liệu Nhập kho từ FACT_INBOUND
+   */
+  _loadFactInbound(schemaMap) {
+    const table = this._getTableData("FACT_INBOUND");
+    const rows  = table ? table.values : [];
+    const result = {}; // { period: { inventory_sku: { qty, amt } } }
+
+    if (rows && rows.length > 1) {
+      const pIdx   = this._getColIndex(schemaMap, "FACT_INBOUND", "period");
+      const skuIdx = this._getColIndex(schemaMap, "FACT_INBOUND", "inventory_sku");
+      
+      let qtyIdx = this._getColIndex(schemaMap, "FACT_INBOUND", "base_qty");
+      if (qtyIdx === -1) qtyIdx = this._getColIndex(schemaMap, "FACT_INBOUND", "quantity");
+
+      const amtIdx = this._getColIndex(schemaMap, "FACT_INBOUND", "amount");
 
       for (let i = 1; i < rows.length; i++) {
-        const p   = String(rows[i][pIdx] || "").trim();
-        const ing = String(rows[i][ingIdx] || "").trim();
-        const q   = Number(rows[i][qtyIdx]) || 0;
+        const p   = pIdx !== -1 ? this._normalizePeriod(rows[i][pIdx]) : "";
+        const sku = skuIdx !== -1 ? String(rows[i][skuIdx] || "").trim() : "";
+        const q   = qtyIdx !== -1 ? Number(rows[i][qtyIdx]) || 0 : 0;
+        const a   = amtIdx !== -1 ? Number(rows[i][amtIdx]) || 0 : 0;
 
-        if (p && ing) {
+        if (p && sku) {
           if (!result[p]) result[p] = {};
-          if (!result[p][ing]) result[p][ing] = { qty: 0 };
-          result[p][ing].qty += q;
+          if (!result[p][sku]) result[p][sku] = { qty: 0, amt: 0 };
+          result[p][sku].qty += q;
+          result[p][sku].amt += a;
         }
       }
     }
     return result;
   }
 
-  _getColIndex(tableName, colKey) {
+  /**
+   * Đọc dữ liệu Xuất kho từ FACT_OUTBOUND
+   */
+  _loadFactOutbound(schemaMap) {
+    const table = this._getTableData("FACT_OUTBOUND");
+    const rows  = table ? table.values : [];
+    const result = {}; // { period: { inventory_sku: { qty } } }
+
+    if (rows && rows.length > 1) {
+      const pIdx = this._getColIndex(schemaMap, "FACT_OUTBOUND", "period");
+      
+      let skuIdx = this._getColIndex(schemaMap, "FACT_OUTBOUND", "child_item_code");
+      if (skuIdx === -1) skuIdx = this._getColIndex(schemaMap, "FACT_OUTBOUND", "inventory_sku");
+
+      let qtyIdx = this._getColIndex(schemaMap, "FACT_OUTBOUND", "consumed_qty");
+      if (qtyIdx === -1) qtyIdx = this._getColIndex(schemaMap, "FACT_OUTBOUND", "quantity");
+
+      for (let i = 1; i < rows.length; i++) {
+        const p   = pIdx !== -1 ? this._normalizePeriod(rows[i][pIdx]) : "";
+        const sku = skuIdx !== -1 ? String(rows[i][skuIdx] || "").trim() : "";
+        const q   = qtyIdx !== -1 ? Number(rows[i][qtyIdx]) || 0 : 0;
+
+        if (p && sku) {
+          if (!result[p]) result[p] = {};
+          if (!result[p][sku]) result[p][sku] = { qty: 0 };
+          result[p][sku].qty += q;
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Lưu kết quả vào bảng FACT_INVENTORY_BALANCE qua TableRepository
+   */
+  _saveToFactTable(calculatedRowsByPeriod, filterPeriods, schemaMap) {
+    const targetTable = this._getTableData(this.schemaName);
+    const existingValues = targetTable ? targetTable.values : [];
+    
+    const defaultHeader = [
+      "period", "inventory_sku", "opening_qty", "opening_amount",
+      "inbound_qty", "inbound_amount", "outbound_qty", "outbound_amount",
+      "closing_qty", "avg_unit_cost", "closing_amount"
+    ];
+
+    const header = (existingValues && existingValues.length > 0) ? existingValues[0] : defaultHeader;
+    let rowsToWrite = [];
+
+    if (filterPeriods && filterPeriods.length > 0) {
+      const preservedRows = [];
+      const pIdx = this._getColIndex(schemaMap, this.schemaName, "period");
+
+      for (let i = 1; i < existingValues.length; i++) {
+        const rowP = pIdx !== -1 ? this._normalizePeriod(existingValues[i][pIdx]) : "";
+        if (!filterPeriods.includes(rowP)) {
+          preservedRows.push(existingValues[i]);
+        }
+      }
+
+      rowsToWrite = [...preservedRows];
+      filterPeriods.forEach(p => {
+        if (calculatedRowsByPeriod[p]) {
+          rowsToWrite.push(...calculatedRowsByPeriod[p]);
+        }
+      });
+    } else {
+      Object.values(calculatedRowsByPeriod).forEach(periodRows => {
+        rowsToWrite.push(...periodRows);
+      });
+    }
+
+    const finalData = [header, ...rowsToWrite];
+    
+    // Sử dụng phương thức ghi dữ liệu chuẩn của DAL
+    this.tableRepo.updateTableData(this.schemaName, finalData);
+
+    return rowsToWrite.length;
+  }
+
+  /**
+   * Helper gọi SchemaService.getColIndex và chuyển đổi 1-based index sang 0-based index
+   */
+  _getColIndex(schemaMap, schemaName, colKey) {
     if (!this.schemaService) return -1;
-    const schemaMap = this.schemaService.getSchemaMap();
-    const idx = this.schemaService.getColIndex(schemaMap, tableName, colKey);
-    if (idx !== undefined && idx !== null && !isNaN(idx)) {
-      const numIdx = Number(idx);
-      return numIdx > 0 ? numIdx - 1 : numIdx;
+    
+    let col1Based = -1;
+    if (typeof this.schemaService.getColIndex === 'function') {
+      col1Based = this.schemaService.getColIndex(schemaMap, schemaName, colKey);
     }
-    return -1;
+
+    return col1Based > 0 ? col1Based - 1 : -1;
+  }
+
+  _normalizePeriod(val) {
+    if (!val) return "";
+    const str = String(val).replace(/[^0-9]/g, "");
+    return str.length >= 6 ? str.substring(0, 6) : str;
   }
 }

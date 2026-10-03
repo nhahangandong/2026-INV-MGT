@@ -1,13 +1,14 @@
 /**
  * [SERVICE] FactProcessingService.js
  * Xử lý tính toán và đổ dữ liệu từ STG sang FACT.
- * - Sửa lỗi map cột inventory_sku vào FACT_INBOUND
- * - Chuẩn hóa tra cứu giá vốn 4 cấp (Kỳ N -> Kỳ N-x -> STG_INVENTORY_OPENING -> ITEM_MASTER.base_cost)
+ * - Sửa lỗi map cột inventory_sku vào FACT_INBOUND & FACT_OUTBOUND
+ * - Tra cứu giá vốn 4 cấp (Kỳ N -> Kỳ N-x -> STG_INVENTORY_OPENING -> ITEM_MASTER.base_cost)
+ * - Tích hợp tra cứu tỷ lệ phân bổ Overhead theo Ma trận Danh mục & Thời gian (Time-versioning)
  */
 class FactProcessingService {
   constructor(tableRepo, schemaService, sysConfigService = null, bomService = null) {
     if (!tableRepo || !schemaService) {
-      throw new Error("[FactProcessingService] Thiếu Dependency bắt buộc (tableRepo, schemaService).");
+      throw new Error("[FactProcessingService] Thieu Dependency bat buộc (tableRepo, schemaService).");
     }
     this.tableRepo = tableRepo;
     this.schemaService = schemaService;
@@ -37,41 +38,45 @@ class FactProcessingService {
       if (!rawVal) return fallbackValue;
       return (typeof rawVal === 'string') ? JSON.parse(rawVal) : rawVal;
     } catch (e) {
-      Logger.log(`[WARN] Lỗi parse JSON cho configKey '${configKey}': ${e.message}`);
+      Logger.log(`[WARN] Loi parse JSON cho configKey '${configKey}': ${e.message}`);
       return fallbackValue;
     }
   }
 
-  _buildAllocationRuleDictionary() {
+  /**
+   * Doc danh sach ALLOCATION_RULE theo luoc do moi
+   */
+  _buildAllocationRulesList() {
     const allocInfo = this.tableRepo.getDataByTableName("ALLOCATION_RULE");
     const allocRows = allocInfo ? allocInfo.values : [];
-    
-    const result = {
-      itemOverheadMap: {},
-      defaultRate: 0
-    };
+    const rulesList = [];
 
     if (allocRows && allocRows.length > 1) {
-      const codeIdx   = this._getColIndex("ALLOCATION_RULE", "item_code");
-      const rateIdx   = this._getColIndex("ALLOCATION_RULE", "allocation_rate");
-      const activeIdx = this._getColIndex("ALLOCATION_RULE", "is_active");
+      const pCatIdx    = this._getColIndex("ALLOCATION_RULE", "parent_category");
+      const targetIdx  = this._getColIndex("ALLOCATION_RULE", "target_type");
+      const rateIdx    = this._getColIndex("ALLOCATION_RULE", "allocation_rate");
+      const effFromIdx = this._getColIndex("ALLOCATION_RULE", "effective_from");
+      const effToIdx   = this._getColIndex("ALLOCATION_RULE", "effective_to");
+      const activeIdx  = this._getColIndex("ALLOCATION_RULE", "is_active");
+      const prioIdx    = this._getColIndex("ALLOCATION_RULE", "priority");
 
       for (let i = 1; i < allocRows.length; i++) {
         const rawActive = String(allocRows[i][activeIdx] || "").trim().toUpperCase();
         const isActive  = rawActive === "TRUE" || rawActive === "1" || allocRows[i][activeIdx] === true;
         if (!isActive) continue;
 
-        const itemCode = codeIdx !== -1 ? String(allocRows[i][codeIdx] || "").trim() : "";
-        const rate     = rateIdx !== -1 ? (Number(allocRows[i][rateIdx]) || 0) : 0;
-
-        if (itemCode && itemCode.toUpperCase() !== "ALL" && itemCode !== "*") {
-          result.itemOverheadMap[itemCode] = rate;
-        } else {
-          result.defaultRate = rate;
-        }
+        rulesList.push({
+          parentCategory: pCatIdx !== -1 ? String(allocRows[i][pCatIdx] || "").trim() : "ALL",
+          targetType:     targetIdx !== -1 ? String(allocRows[i][targetIdx] || "").trim() : "RAW_MATERIAL",
+          allocationRate: rateIdx !== -1 ? (Number(allocRows[i][rateIdx]) || 0) : 0,
+          effectiveFrom:  effFromIdx !== -1 ? allocRows[i][effFromIdx] : "1970-01-01",
+          effectiveTo:    effToIdx !== -1 ? allocRows[i][effToIdx] : "2099-12-31",
+          priority:       prioIdx !== -1 ? (Number(allocRows[i][prioIdx]) || 99) : 99,
+          isActive:       true
+        });
       }
     }
-    return result;
+    return rulesList;
   }
 
   _buildUnitConversionDictionary(sourceGroup) {
@@ -91,7 +96,7 @@ class FactProcessingService {
         const code    = String(ucRows[i][codeIdx] || "").trim();
         const altUnit = String(ucRows[i][altIdx] || "").trim().toLowerCase();
         
-        if ((grp === sourceGroup || grp === "PO" || grp === "INT" || grp === "ALL") && code && altUnit) {
+        if ((grp === sourceGroup || grp === "SO" || grp === "PO" || grp === "INT" || grp === "ALL") && code && altUnit) {
           const key = [grp, code, altUnit].join(this.KEY_DELIMITER);
           dict[key] = {
             baseUnit: String(ucRows[i][baseIdx] || "").trim().toLowerCase(),
@@ -103,6 +108,9 @@ class FactProcessingService {
     return dict;
   }
 
+  /**
+   * Doc ITEM_MASTER voi day du category va item_type
+   */
   _buildItemMasterDictionary() {
     const imInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
     const imRows = imInfo ? imInfo.values : [];
@@ -112,13 +120,15 @@ class FactProcessingService {
     };
 
     if (imRows && imRows.length > 1) {
-      const codeIdx   = this._getColIndex("ITEM_MASTER", "item_code");
-      const baseIdx   = this._getColIndex("ITEM_MASTER", "base_unit");
-      const invSkuIdx = this._getColIndex("ITEM_MASTER", "inventory_sku") !== -1 
-                         ? this._getColIndex("ITEM_MASTER", "inventory_sku") 
-                         : this._getColIndex("ITEM_MASTER", "inventory_code");
+      const codeIdx     = this._getColIndex("ITEM_MASTER", "item_code");
+      const baseIdx     = this._getColIndex("ITEM_MASTER", "base_unit");
+      const invSkuIdx   = this._getColIndex("ITEM_MASTER", "inventory_sku") !== -1 
+                           ? this._getColIndex("ITEM_MASTER", "inventory_sku") 
+                           : this._getColIndex("ITEM_MASTER", "inventory_code");
       const factorIdx   = this._getColIndex("ITEM_MASTER", "stg_factor_to_base");
       const baseCostIdx = this._getColIndex("ITEM_MASTER", "base_cost");
+      const catIdx      = this._getColIndex("ITEM_MASTER", "category");
+      const typeIdx     = this._getColIndex("ITEM_MASTER", "item_type");
 
       for (let i = 1; i < imRows.length; i++) {
         const itemCode = String(imRows[i][codeIdx] || "").trim();
@@ -126,13 +136,17 @@ class FactProcessingService {
         const baseUnit = String(imRows[i][baseIdx] || "").trim().toLowerCase();
         const factor   = factorIdx !== -1 ? (Number(imRows[i][factorIdx]) || 1) : 1;
         const baseCost = baseCostIdx !== -1 ? (Number(imRows[i][baseCostIdx]) || 0) : 0;
+        const category = catIdx !== -1 ? String(imRows[i][catIdx] || "").trim() : "";
+        const itemType = typeIdx !== -1 ? String(imRows[i][typeIdx] || "").trim() : "";
 
         const info = {
           itemCode,
           inventorySku: invSku || itemCode,
           baseUnit,
           stgFactor: factor,
-          baseCost
+          baseCost,
+          category,
+          itemType
         };
 
         if (itemCode) dict.byItemCode[itemCode] = info;
@@ -164,9 +178,6 @@ class FactProcessingService {
     return { factor, baseUnit };
   }
 
-  /**
-   * Tổng hợp đơn giá bình quân nhập kho theo [period, inventory_sku]
-   */
   _buildInboundAvgPriceDict() {
     const factInfo = this.tableRepo.getDataByTableName("FACT_INBOUND");
     const factRows = factInfo ? factInfo.values : [];
@@ -207,10 +218,6 @@ class FactProcessingService {
     return priceDict;
   }
 
-  /**
-   * Đọc bảng tồn kho đầu kỳ STG_INVENTORY_OPENING
-   * Ánh xạ item_code -> inventory_sku thông qua ITEM_MASTER để lưu theo inventory_sku
-   */
   _buildOpeningInventoryPriceDict(imDict) {
     const opInfo = this.tableRepo.getDataByTableName("STG_INVENTORY_OPENING");
     const opRows = opInfo ? opInfo.values : [];
@@ -232,7 +239,6 @@ class FactProcessingService {
         const itemCode = String(opRows[i][codeIdx] || "").trim();
         if (!itemCode) continue;
 
-        // Tra cứu SKU từ ITEM_MASTER
         const imInfo = imDict.byItemCode[itemCode] || {};
         const sku = imInfo.inventorySku || itemCode;
 
@@ -255,19 +261,11 @@ class FactProcessingService {
     return dict;
   }
 
-  /**
-   * Tra cứu Đơn giá vốn (est_unit_cost) theo đúng quy ước 4 cấp:
-   * 1. Kỳ hiện tại N trong FACT_INBOUND
-   * 2. Các kỳ lùi dần (N-1, N-2...) trong FACT_INBOUND
-   * 3. Bảng tồn kho đầu kỳ STG_INVENTORY_OPENING (tra cứu qua ITEM_MASTER)
-   * 4. Trường base_cost trong ITEM_MASTER
-   */
   _resolveEstUnitCost(period, childItemCode, inboundPriceDict, openingPriceDict, imDict) {
     if (!childItemCode) return 0;
 
     const currentPeriodNum = Number(period);
 
-    // BƯỚC 1 & 2: Tra cứu trong FACT_INBOUND (Kỳ N -> Kỳ N-1 -> N-2...)
     const availablePeriods = Object.keys(inboundPriceDict)
       .map(k => k.split(this.KEY_DELIMITER)[0])
       .filter((v, idx, arr) => arr.indexOf(v) === idx)
@@ -283,14 +281,54 @@ class FactProcessingService {
       }
     }
 
-    // BƯỚC 3: Tra cứu trong STG_INVENTORY_OPENING (đã được map theo inventory_sku)
     if (openingPriceDict.hasOwnProperty(childItemCode) && openingPriceDict[childItemCode] > 0) {
       return openingPriceDict[childItemCode];
     }
 
-    // BƯỚC 4: Fallback về base_cost trong ITEM_MASTER
     const imInfo = imDict.byInventorySku[childItemCode] || imDict.byItemCode[childItemCode] || {};
     return imInfo.baseCost || 0;
+  }
+
+  getOverheadRate(parentItemCode, childItemCode, transDate, imDict, allocRules) {
+    if (!childItemCode) return 0;
+
+    const parentInfo = imDict.byItemCode[parentItemCode] || {};
+    const childInfo  = imDict.byInventorySku[childItemCode] || imDict.byItemCode[childItemCode] || {};
+
+    const parentCategory = (parentInfo.category || 'ALL').trim().toUpperCase();
+    const childItemType  = (childInfo.itemType || '').trim().toUpperCase();
+
+    if (childItemType !== 'RAW_MATERIAL') {
+      return 0;
+    }
+
+    const validRules = allocRules.filter(rule => {
+      if (!rule.isActive) return false;
+    
+      const effFrom = new Date(rule.effectiveFrom);
+      const effTo   = new Date(rule.effectiveTo);
+      const tDate   = new Date(transDate);
+    
+      if (tDate < effFrom || tDate > effTo) return false;
+      if (rule.targetType && rule.targetType.toUpperCase() !== 'RAW_MATERIAL') return false;
+
+      const ruleCategory = (rule.parentCategory || 'ALL').toUpperCase();
+      return ruleCategory === parentCategory || ruleCategory === 'ALL';
+    });
+
+    if (validRules.length === 0) {
+      return 0;
+    }
+
+    validRules.sort((a, b) => {
+      if (a.priority === b.priority) {
+        if (a.parentCategory !== 'ALL' && b.parentCategory === 'ALL') return -1;
+        if (a.parentCategory === 'ALL' && b.parentCategory !== 'ALL') return 1;
+      }
+      return a.priority - b.priority;
+    });
+
+    return validRules[0].allocationRate;
   }
 
   processFactInbound(periodFilter = null) {
@@ -366,7 +404,6 @@ class FactProcessingService {
       const basePrice   = factor !== 0 ? price / factor : price;
       const totalAmount = amount + taxAmt;
 
-      // Object cấu trúc chuẩn với cả 'inventory_sku' lẫn 'child_item_code'
       const computedFactObj = {
         "period":          period,
         "trans_date":      invDate,
@@ -401,38 +438,40 @@ class FactProcessingService {
 
     if (factRows.length > 0) {
       this.tableRepo.upsertRowsByTableName(factSchemaKey, factRows, primaryKeys);
-      Logger.log(`[FACT INBOUND] Đã xử lý & ghi thành công ${factRows.length} dòng vào FACT_INBOUND.`);
+      Logger.log(`[FACT INBOUND] Da xu ly & ghi thanh cong ${factRows.length} dong vao FACT_INBOUND.`);
     }
 
     return factRows.length;
   }
 
+  /**
+   * Tinh toan Fact Outbound tu STG_SO_INVOICE + BOM_RECIPE
+   * Map chinh xac theo Schema FACT_OUTBOUND
+   */
   processFactOutbound(periodFilter = null) {
     const stgSchemaKey = "STG_SO_INVOICE";
     const factSchemaKey = "FACT_OUTBOUND";
 
-    const primaryKeys = this._getSysConfigJson(
-      "FACT_OUTBOUND_PRIMARY_KEYS", 
-      ["doc_code", "line_no", "child_item_code"]
-    );
+    const primaryKeys = this._getSysConfigJson("FACT_OUTBOUND_PRIMARY_KEYS", ["doc_code", "line_no", "child_item_code"]);
 
     const stgInfo = this.tableRepo.getDataByTableName(stgSchemaKey);
     const stgRows = stgInfo ? stgInfo.values : [];
-    if (!stgRows || stgRows.length <= 1) {
-      Logger.log("[FACT OUTBOUND] Bảng STG_SO_INVOICE không có dữ liệu!");
-      return 0;
+    if (!stgRows || stgRows.length <= 1) return 0;
+
+    if (!this.bomService) {
+      throw new Error("[FactProcessingService] Thieu bomService khi xu ly processFactOutbound.");
     }
 
-    const allocDict        = this._buildAllocationRuleDictionary();
-    const ucDict           = this._buildUnitConversionDictionary("SO");
-    const imDict           = this._buildItemMasterDictionary();
+    const ucDict = this._buildUnitConversionDictionary("SO");
+    const imDict = this._buildItemMasterDictionary();
+    const allocRulesList = this._buildAllocationRulesList();
     const inboundPriceDict = this._buildInboundAvgPriceDict();
     const openingPriceDict = this._buildOpeningInventoryPriceDict(imDict);
 
     const idxSTG = {
       period:   this._getColIndex(stgSchemaKey, "period"),
-      invDate:  this._getColIndex(stgSchemaKey, "invoice_date"),
-      invCode:  this._getColIndex(stgSchemaKey, "invoice_code"),
+      transDate:this._getColIndex(stgSchemaKey, "invoice_date") !== -1 ? this._getColIndex(stgSchemaKey, "invoice_date") : this._getColIndex(stgSchemaKey, "trans_date"),
+      docCode:  this._getColIndex(stgSchemaKey, "invoice_code") !== -1 ? this._getColIndex(stgSchemaKey, "invoice_code") : this._getColIndex(stgSchemaKey, "doc_code"),
       lineNo:   this._getColIndex(stgSchemaKey, "line_no"),
       itemCode: this._getColIndex(stgSchemaKey, "item_code"),
       unit:     this._getColIndex(stgSchemaKey, "unit"),
@@ -444,8 +483,7 @@ class FactProcessingService {
     const parseNum = (val) => {
       if (typeof val === 'number') return isNaN(val) ? 0 : val;
       if (val === null || val === undefined) return 0;
-      const cleanStr = String(val).replace(/,/g, '').trim();
-      const num = Number(cleanStr);
+      const num = Number(String(val).replace(/,/g, '').trim());
       return isNaN(num) ? 0 : num;
     };
 
@@ -460,92 +498,90 @@ class FactProcessingService {
 
     const factRows = [];
     const cleanPeriodFilter = periodFilter !== null && periodFilter !== undefined ? toCleanString(periodFilter) : "";
-    const missingBomSet = new Set();
 
     for (let i = 1; i < stgRows.length; i++) {
       const r = stgRows[i];
 
       const period = idxSTG.period !== -1 ? toCleanString(r[idxSTG.period]) : "";
-      if (cleanPeriodFilter !== "" && period !== cleanPeriodFilter) {
-        continue;
-      }
+      if (cleanPeriodFilter !== "" && period !== cleanPeriodFilter) continue;
 
-      const invCode = idxSTG.invCode !== -1 ? toCleanString(r[idxSTG.invCode]) : "";
-      if (!invCode) continue;
+      const docCode = idxSTG.docCode !== -1 ? toCleanString(r[idxSTG.docCode]) : "";
+      if (!docCode) continue;
 
-      const lineNo   = idxSTG.lineNo !== -1 ? toCleanString(r[idxSTG.lineNo]) : "";
-      const invDate  = idxSTG.invDate !== -1 ? r[idxSTG.invDate] : "";
-      const parentItemCode = idxSTG.itemCode !== -1 ? toCleanString(r[idxSTG.itemCode]) : "";
-      const soldQty  = parseNum(idxSTG.qty !== -1 ? r[idxSTG.qty] : 0);
+      const lineNo    = idxSTG.lineNo !== -1 ? toCleanString(r[idxSTG.lineNo]) : "";
+      const transDate = idxSTG.transDate !== -1 ? r[idxSTG.transDate] : "";
+      const parentCode= idxSTG.itemCode !== -1 ? toCleanString(r[idxSTG.itemCode]) : "";
+      const stgUnit   = idxSTG.unit !== -1 ? toCleanString(r[idxSTG.unit]) : "";
+      const soldQty   = parseNum(idxSTG.qty !== -1 ? r[idxSTG.qty] : 0);
 
-      if (!parentItemCode || soldQty === 0) continue;
+      if (!parentCode) continue;
 
-      let bomComponents = [];
-      if (this.bomService && typeof this.bomService.explodeBom === 'function') {
-        bomComponents = this.bomService.explodeBom(parentItemCode, 1, period);
-      }
+      // 1. Lay danh sach thanh phan BOM tu BomService
+      const rawBomComponents = this.bomService.getBomComponents(parentCode, transDate) || [];
 
-      if (!bomComponents || bomComponents.length === 0) {
-        if (this.bomService && typeof this.bomService.getDirectRecipe === 'function') {
-          bomComponents = this.bomService.getDirectRecipe(parentItemCode, period);
+      // 2. LOC CHI LAY CAC DONG BOM CO IS_ACTIVE = TRUE VA CHILD_ITEM_CODE VALID (!= NULL/RONG)
+      const validBomComponents = rawBomComponents.filter(comp => {
+        // Kiem tra is_active
+        const isActiveVal = comp.is_active !== undefined ? comp.is_active : comp.isActive;
+        let isActive = true;
+        if (isActiveVal !== undefined && isActiveVal !== null) {
+          if (typeof isActiveVal === 'boolean') isActive = isActiveVal;
+          else if (typeof isActiveVal === 'string') isActive = isActiveVal.trim().toLowerCase() === 'true' || isActiveVal.trim() === '1';
+          else if (typeof isActiveVal === 'number') isActive = isActiveVal === 1;
+          else isActive = Boolean(isActiveVal);
         }
-      }
+        if (!isActive) return false;
 
-      if (!bomComponents || bomComponents.length === 0) {
-        missingBomSet.add(parentItemCode);
+        // Kiem tra child_item_code phai ton tai
+        const rawChildCode = comp.child_item_code || comp.childItemCode;
+        const childCode = rawChildCode ? String(rawChildCode).trim() : "";
+        return childCode !== "" && childCode.toLowerCase() !== "null";
+      });
+
+      // KHONG GHI NHAN OUTBOUND NEU KHONG CO DONG CHILD_ITEM HOP LE
+      if (validBomComponents.length === 0) {
         continue;
       }
 
-      bomComponents.forEach(comp => {
-        const childItemCode = toCleanString(
-          comp.child_item_code || 
-          comp.childItemCode || 
-          comp.inventory_sku || 
-          ""
-        );
+      // 3. CHI THEM VAO FACT_OUTBOUND KHI CO DINH LUONG BUNG BOM CHUAN
+      validBomComponents.forEach(comp => {
+        const rawChildCode = comp.child_item_code || comp.childItemCode;
+        const childCode = String(rawChildCode).trim();
 
-        if (!childItemCode) return;
+        const bomNormQty = Number(comp.std_qty || comp.stdQty) || 0;
+        const bomDepth   = Number(comp.bom_level || comp.bomLevel) || 1;
 
-        const bomDepth = parseNum(comp.bom_level || comp.bomDepth) || 1;
-        const normQty  = parseNum(comp.std_qty || comp.normQty) || 1;
-        
-        const compImInfo = imDict.byInventorySku[childItemCode] || imDict.byItemCode[childItemCode] || {};
-        const baseUnit   = toCleanString(comp.unit || comp.baseUnit || compImInfo.baseUnit || "").toLowerCase();
+        const childInfo = imDict.byItemCode[childCode] || imDict.byInventorySku[childCode] || {};
+        const childSku  = childInfo.inventorySku || childCode;
+        const baseUnit  = comp.unit || childInfo.baseUnit || stgUnit;
 
-        const consumedQty = soldQty * normQty;
-        
-        // Tính giá vốn theo quy ước 4 cấp
-        const estUnitCost = comp.unitCost || this._resolveEstUnitCost(period, childItemCode, inboundPriceDict, openingPriceDict, imDict);
+        // Tinh toan consumed_qty, chi phi
+        const consumedQty = soldQty * bomNormQty;
+        const estUnitCost = this._resolveEstUnitCost(period, childSku, inboundPriceDict, openingPriceDict, imDict);
         const rawFoodCost = consumedQty * estUnitCost;
 
-        let overheadRate = 0;
-        if (allocDict.itemOverheadMap.hasOwnProperty(parentItemCode)) {
-          overheadRate = allocDict.itemOverheadMap[parentItemCode];
-        } else if (allocDict.itemOverheadMap.hasOwnProperty(childItemCode)) {
-          overheadRate = allocDict.itemOverheadMap[childItemCode];
-        } else {
-          overheadRate = allocDict.defaultRate;
-        }
-
-        const overheadAmt = rawFoodCost * overheadRate;
+        // Tra cuu Overhead Rate
+        const overheadRate = this.getOverheadRate(parentCode, childSku, transDate, imDict, allocRulesList);
+        const overheadCost = rawFoodCost * overheadRate;
+        const totalFoodCost = rawFoodCost + overheadCost;
 
         const computedFactObj = {
           "period":           period,
-          "trans_date":       invDate,
-          "doc_code":         invCode,
+          "trans_date":       transDate,
+          "doc_code":         docCode,
           "line_no":          lineNo,
-          "parent_item_code": parentItemCode,
-          "child_item_code":  childItemCode,
+          "parent_item_code": parentCode,
+          "child_item_code":  childSku,
           "bom_depth":        bomDepth,
           "sold_qty":         soldQty,
-          "bom_norm_qty":     normQty,
+          "bom_norm_qty":     bomNormQty,
           "base_unit":        baseUnit,
           "consumed_qty":     consumedQty,
           "est_unit_cost":    estUnitCost,
           "raw_food_cost":    rawFoodCost,
           "overhead_rate":    overheadRate,
-          "overhead_amount":  overheadAmt,
-          "total_cogs":       rawFoodCost + overheadAmt
+          "overhead_cost":    overheadCost,
+          "total_food_cost":  totalFoodCost
         };
 
         const projectedRow = [];
@@ -565,13 +601,9 @@ class FactProcessingService {
       });
     }
 
-    if (missingBomSet.size > 0) {
-      Logger.log(`[WARN] Có ${missingBomSet.size} mã trong STG chưa khai báo/chưa active BOM: ${Array.from(missingBomSet).join(", ")}`);
-    }
-
     if (factRows.length > 0) {
       this.tableRepo.upsertRowsByTableName(factSchemaKey, factRows, primaryKeys);
-      Logger.log(`[FACT OUTBOUND] Đã xử lý & ghi thành công ${factRows.length} dòng vào FACT_OUTBOUND.`);
+      Logger.log(`[FACT OUTBOUND] Da xu ly & ghi thanh cong ${factRows.length} dong vao FACT_OUTBOUND.`);
     }
 
     return factRows.length;

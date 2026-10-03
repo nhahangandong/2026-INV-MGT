@@ -25,16 +25,19 @@ function _executeStagingFlow(sourceGroup) {
   const stagingService = new DataStagingService(tableRepo, schemaService, sysConfigService);
 
   try {
-    const count = stagingService.runStaging(normGroup, null, filters);
+    // FIX 1: Truyền đúng vị trí tham số filters (bỏ tham số null bị thừa)
+    const res = stagingService.runStaging(normGroup, filters);
 
     const filterInfo = periodFilter ? ` (Kỳ: ${periodFilter})` : " (Toàn bộ kỳ)";
+    
+    // FIX 2: Biến 'res' đã tồn tại, hiển thị đúng số lượng dòng chuyển đổi
     SpreadsheetApp.getUi().alert(
       "Thành công!", 
-      `Đã chuyển đổi hoàn tất ${count} dòng dữ liệu cho nguồn [${normGroup}]${filterInfo}.`, 
+      `Đã chuyển đổi hoàn tất ${res.transformedCount} dòng dữ liệu cho nguồn [${normGroup}]${filterInfo}.`, 
       SpreadsheetApp.getUi().ButtonSet.OK
     );
 
-    return count;
+    return res;
 
   } catch (error) {
     Logger.log(`[ERROR] Lỗi thực thi Staging ${normGroup}: ${error.message}`);
@@ -91,7 +94,7 @@ function menuBootstrapUnitConversion() {
 }
 
 /**
- * Controller kích hoạt Tự động gán mã Nguyên liệu (ingredient_code) cho ITEM_MASTER
+ * Controller kích hoạt Tự động gán mã Nguyên liệu (inventory_sku) cho ITEM_MASTER
  */
 function menuApplyAutoSkuRules() {
   const ui = SpreadsheetApp.getUi();
