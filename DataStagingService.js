@@ -1,5 +1,5 @@
 /**
- * [SERVICE] DataStagingService - Cải tiến: Làm sạch số + Tối ưu thời gian thực thi
+ * [SERVICE] DataStagingService - Sửa triệt để lỗi xóa item_name, item_code ở các kỳ khác
  */
 class DataStagingService {
   constructor(tableRepo, schemaService, sysConfigService) {
@@ -10,11 +10,15 @@ class DataStagingService {
     this.schemaService = schemaService;
     this.sysConfigService = sysConfigService;
 
-    // Danh sách các từ khóa nhận diện cột dữ liệu kiểu số
     this.numberKeywords = ["qty", "quantity", "amount", "price", "rate", "tax", "total", "discount", "val", "cost", "vat"];
   }
 
-  // --- HÀM TRỢ LÝ LÀM SẠCH DỮ LIỆU SỐ ---
+  // --- Chuẩn hóa định dạng Kỳ ---
+  _normalizePeriod(val) {
+    if (val === null || val === undefined) return "";
+    return String(val).replace(/[^0-9]/g, "").trim();
+  }
+
   _cleanNumber(val) {
     if (val === null || val === undefined || val === "") return 0;
     if (typeof val === "number") return isNaN(val) ? 0 : val;
@@ -22,10 +26,8 @@ class DataStagingService {
     let str = String(val).trim();
     if (!str) return 0;
 
-    // Loại bỏ ký tự tiền tệ hoặc khoảng trắng
     str = str.replace(/[^0-9\,\.\-]/g, "");
 
-    // Xu ly định dạng việt nam/châu âu: 1.000.000,50 -> 1000000.50
     if (str.includes(",") && str.includes(".")) {
       if (str.lastIndexOf(",") > str.lastIndexOf(".")) {
         str = str.replace(/\./g, "").replace(",", ".");
@@ -33,7 +35,6 @@ class DataStagingService {
         str = str.replace(/,/g, "");
       }
     } else if (str.includes(",")) {
-      // Nếu chỉ chứa dấu phẩy, kiểm tra xem có phải dấu phân cách thập phân không
       const parts = str.split(",");
       if (parts.length === 2 && parts[1].length <= 2) {
         str = str.replace(",", ".");
@@ -82,7 +83,7 @@ class DataStagingService {
   }
 
   /**
-   * Pipeline chính - Tối ưu thời gian chạy toàn cục
+   * Pipeline chính
    */
   runStaging(sourceGroup, filters = null) {
     const t0 = Date.now();
@@ -90,21 +91,23 @@ class DataStagingService {
 
     let periodList = null;
     if (filters && filters.key === "period" && Array.isArray(filters.values)) {
-      periodList = filters.values.map(p => String(p).trim());
+      periodList = filters.values.map(p => this._normalizePeriod(p));
     } else if (Array.isArray(filters)) {
-      periodList = filters.map(p => String(p).trim());
+      periodList = filters.map(p => this._normalizePeriod(p));
+    } else if (typeof filters === "string" || typeof filters === "number") {
+      periodList = [this._normalizePeriod(filters)];
     }
 
-    // 1. Chuyển RAW -> STG & Làm sạch số (đã lọc theo periodList)
+    // 1. Chuyển RAW -> STG
     const transformedCount = this.transformRawToStaging(sourceGroup, periodList);
     
-    // 2. Gợi ý ánh xạ MAP_RULE
-    this.applyAutoMapNamesToMapRules(sourceGroup);
+    // 2. Gợi ý ánh xạ MAP_RULE (ĐÃ BỔ SUNG LỌC THEO PERIODLIST)
+    this.applyAutoMapNamesToMapRules(sourceGroup, periodList);
 
     // 3. Tạo mã item_code & Đồng bộ ITEM_MASTER
     this.generateAndSyncItemCodes();
 
-    // 4. SỬA TẠI ĐÂY: Truyền trực tiếp periodList vào hàm cập nhật STG
+    // 4. Cập nhật item_code/item_name vào STG
     const updatedCount = this.updateStagingMappedFields(sourceGroup, periodList);
 
     // 5. Quy đổi đơn vị & SKU
@@ -117,142 +120,13 @@ class DataStagingService {
 
     Logger.log(`[STAGING] Hoàn tất ${transformedCount} bản ghi trong: ${Date.now() - t0} ms.`);
 
+    // Trả về kết quả rõ ràng
     return {
       transformedCount: transformedCount,
       updatedCount: updatedCount
     };
   }
 
-  /**
-   * Biến đổi dữ liệu thô (RAW) sang bảng trung gian (STG) + Làm sạch số
-   */
-  // transformRawToStaging(sourceGroup, periodList = null, overridePrimaryKeys = null) {
-  //   const srcMeta = this.sysConfigService.getSourceMetadata(sourceGroup);
-  //   if (!srcMeta) throw new Error(`[transformRawToStaging] Không tìm thấy metadata cho nguồn: ${sourceGroup}`);
-
-  //   const rawSchemaName = srcMeta.rawSchema;
-  //   const stgSchemaName = srcMeta.stgSchema;
-  //   const primaryKeys   = overridePrimaryKeys || srcMeta.primaryKeys || ["period", "line_id"];
-  //   const targetGrp     = (srcMeta.mapRuleGroup || srcMeta.coreGroup || sourceGroup).toUpperCase();
-
-  //   const rawDataInfo = this.tableRepo.getDataByTableName(rawSchemaName);
-  //   if (!rawDataInfo || !rawDataInfo.values || rawDataInfo.values.length <= 1) return 0;
-
-  //   const rawRows = rawDataInfo.values.slice(1);
-  //   const schemaMap = this.schemaService.getSchemaMap();
-  //   const stgColsConfig = schemaMap[stgSchemaName] ? schemaMap[stgSchemaName].columns : {};
-
-  //   const rawPeriodIdx = this._getColIndex(rawSchemaName, "period");
-  //   const rawNameIdx   = this._getColIndex(rawSchemaName, "raw_name");
-
-  //   const stgCols = Object.keys(stgColsConfig);
-  //   const totalStgCols = Math.max(...Object.values(stgColsConfig), stgCols.length);
-
-  //   // Cache trước cặp mapping cột và kiểm tra kiểu số để không lặp trong loop
-  //   const colMappingPairs = [];
-  //   for (let i = 0; i < stgCols.length; i++) {
-  //     const colName = stgCols[i];
-  //     const targetColIdx = stgColsConfig[colName] - 1;
-  //     if (targetColIdx < 0) continue;
-
-  //     let srcColIdx = -1;
-  //     if (srcMeta.mapping && srcMeta.mapping[colName] !== undefined) {
-  //       srcColIdx = this._getColIndex(rawSchemaName, srcMeta.mapping[colName]);
-  //     } else {
-  //       srcColIdx = this._getColIndex(rawSchemaName, colName);
-  //     }
-
-  //     colMappingPairs.push({
-  //       colName: colName,
-  //       targetColIdx: targetColIdx,
-  //       srcColIdx: srcColIdx,
-  //       isNumber: this._isNumberColumn(colName)
-  //     });
-  //   }
-
-  //   const stgRowsToUpsert = [];
-  //   const newRawNamesSet = new Set();
-  //   const periodSet = periodList ? new Set(periodList) : null;
-
-  //   // Vòng lặp tối ưu native for
-  //   for (let i = 0; i < rawRows.length; i++) {
-  //     const row = rawRows[i];
-
-  //     if (periodSet && rawPeriodIdx !== -1) {
-  //       const periodVal = String(row[rawPeriodIdx] || "").trim();
-  //       if (!periodSet.has(periodVal)) continue;
-  //     }
-
-  //     if (rawNameIdx !== -1) {
-  //       const rawNameVal = String(row[rawNameIdx] || "").trim();
-  //       if (rawNameVal) newRawNamesSet.add(rawNameVal);
-  //     }
-
-  //     const newStgRow = new Array(totalStgCols).fill("");
-
-  //     for (let j = 0; j < colMappingPairs.length; j++) {
-  //       const pair = colMappingPairs[j];
-  //       if (pair.srcColIdx !== -1) {
-  //         const rawVal = row[pair.srcColIdx];
-  //         // Nếu là cột kiểu số -> Chuẩn hóa dữ liệu số
-  //         if (pair.isNumber) {
-  //           newStgRow[pair.targetColIdx] = this._cleanNumber(rawVal);
-  //         } else {
-  //           newStgRow[pair.targetColIdx] = rawVal !== undefined && rawVal !== null ? rawVal : "";
-  //         }
-  //       }
-  //     }
-  //     stgRowsToUpsert.push(newStgRow);
-  //   }
-
-  //   if (stgRowsToUpsert.length > 0) {
-  //     this.tableRepo.upsertRowsByTableName(stgSchemaName, stgRowsToUpsert, primaryKeys);
-  //   }
-
-  //   // Bổ sung raw_name mới vào MAP_RULE
-  //   if (newRawNamesSet.size > 0) {
-  //     const mapRuleInfo = this.tableRepo.getDataByTableName("MAP_RULE");
-  //     const existingRawSet = new Set();
-
-  //     if (mapRuleInfo && mapRuleInfo.values && mapRuleInfo.values.length > 1) {
-  //       const mrGrpIdx = this._getColIndex("MAP_RULE", "source_grp");
-  //       const mrRawIdx = this._getColIndex("MAP_RULE", "raw_name");
-  //       const mrRows = mapRuleInfo.values.slice(1);
-
-  //       for (let i = 0; i < mrRows.length; i++) {
-  //         const g = String(mrRows[i][mrGrpIdx] || "").trim().toUpperCase();
-  //         const rn = String(mrRows[i][mrRawIdx] || "").trim().toLowerCase();
-  //         if ((g === targetGrp || g === "ALL") && rn) {
-  //           existingRawSet.add(rn);
-  //         }
-  //       }
-  //     }
-
-  //     const mrColsConfig = schemaMap["MAP_RULE"] ? schemaMap["MAP_RULE"].columns : {};
-  //     const totalMRCols  = Math.max(...Object.values(mrColsConfig), 4);
-  //     const mrGrpIdx     = this._getColIndex("MAP_RULE", "source_grp");
-  //     const mrRawIdx     = this._getColIndex("MAP_RULE", "raw_name");
-
-  //     const newMapRuleRows = [];
-  //     newRawNamesSet.forEach(rawName => {
-  //       if (!existingRawSet.has(rawName.toLowerCase())) {
-  //         const mrRow = new Array(totalMRCols).fill("");
-  //         if (mrGrpIdx !== -1) mrRow[mrGrpIdx] = targetGrp;
-  //         if (mrRawIdx !== -1) mrRow[mrRawIdx] = rawName;
-  //         newMapRuleRows.push(mrRow);
-  //       }
-  //     });
-
-  //     if (newMapRuleRows.length > 0) {
-  //       this.tableRepo.upsertRowsByTableName("MAP_RULE", newMapRuleRows, ["source_grp", "raw_name"]);
-  //     }
-  //   }
-
-  //   return stgRowsToUpsert.length;
-  // }
-  //
-
-  
   transformRawToStaging(sourceGroup, periodList = null, overridePrimaryKeys = null) {
     const srcMeta = this.sysConfigService.getSourceMetadata(sourceGroup);
     if (!srcMeta) throw new Error(`[transformRawToStaging] Không tìm thấy metadata cho nguồn: ${sourceGroup}`);
@@ -274,7 +148,6 @@ class DataStagingService {
     const stgCols = Object.keys(stgColsConfig);
     const totalStgCols = Math.max(...Object.values(stgColsConfig), stgCols.length);
 
-    // Cache thông tin cột
     const colMappingPairs = [];
     for (let i = 0; i < stgCols.length; i++) {
       const colName = stgCols[i];
@@ -299,17 +172,15 @@ class DataStagingService {
     const stgRowsToUpsert = [];
     const newRawNamesSet = new Set();
     
-    // CHUẨN HÓA LỌC THEO KỲ
     const periodSet = (Array.isArray(periodList) && periodList.length > 0) 
-      ? new Set(periodList.map(p => String(p).trim())) 
+      ? new Set(periodList.map(p => this._normalizePeriod(p))) 
       : null;
 
     for (let i = 0; i < rawRows.length; i++) {
       const row = rawRows[i];
 
-      // NẾU CÓ BỘ LỌC KỲ -> BỎ QUA CÁC KỲ KHÁC (NHƯ KỲ 9)
       if (periodSet && rawPeriodIdx !== -1) {
-        const periodVal = String(row[rawPeriodIdx] || "").trim();
+        const periodVal = this._normalizePeriod(row[rawPeriodIdx]);
         if (!periodSet.has(periodVal)) continue; 
       }
 
@@ -334,7 +205,6 @@ class DataStagingService {
       stgRowsToUpsert.push(newStgRow);
     }
 
-    // CHỈ UPSERT DỮ LIỆU CỦA KỲ ĐƯỢC CHỌN VÀO BẢNG STG
     if (stgRowsToUpsert.length > 0) {
       this.tableRepo.upsertRowsByTableName(stgSchemaName, stgRowsToUpsert, primaryKeys);
     }
@@ -342,9 +212,10 @@ class DataStagingService {
     return stgRowsToUpsert.length;
   }
 
-
-  
-  applyAutoMapNamesToMapRules(sourceGroup) {
+  /**
+   * Áp dụng quy tắc Map - Đã sửa lỗi quét full RAW làm mất dữ liệu kỳ khác
+   */
+  applyAutoMapNamesToMapRules(sourceGroup, periodList = null) {
     const srcMeta = this.sysConfigService.getSourceMetadata(sourceGroup) || {};
     const targetGrp = (srcMeta.mapRuleGroup || srcMeta.coreGroup || sourceGroup).toUpperCase();
     const rawSchemaName = srcMeta.rawSchema;
@@ -392,9 +263,21 @@ class DataStagingService {
 
     if (rawDataInfo && rawDataInfo.values && rawDataInfo.values.length > 1) {
       const idxRawName = this._getColIndex(rawSchemaName, "raw_name");
+      const idxRawPeriod = this._getColIndex(rawSchemaName, "period");
+
+      const periodSet = (Array.isArray(periodList) && periodList.length > 0) 
+        ? new Set(periodList.map(p => this._normalizePeriod(p))) 
+        : null;
+
       if (idxRawName !== -1) {
         const rRows = rawDataInfo.values.slice(1);
         for (let i = 0; i < rRows.length; i++) {
+          // BỔ SUNG LỌC THEO KỲ TẠI ĐÂY
+          if (periodSet && idxRawPeriod !== -1) {
+            const periodVal = this._normalizePeriod(rRows[i][idxRawPeriod]);
+            if (!periodSet.has(periodVal)) continue; 
+          }
+
           const rawName = String(rRows[i][idxRawName] || "").trim().toLowerCase();
           if (rawName) activeRawNamesInSource.add(rawName);
         }
@@ -414,6 +297,7 @@ class DataStagingService {
       const rawNameLower = rawName.toLowerCase();
       let currentItemName = String(row[idxMR.itemName] || "").trim();
 
+      // Nếu có bộ lọc Kỳ, chỉ kiểm tra các rawName có mặt trong kỳ đó
       if (activeRawNamesInSource.size > 0 && !activeRawNamesInSource.has(rawNameLower)) {
         continue;
       }
@@ -549,9 +433,6 @@ class DataStagingService {
     return generatedCount;
   }
 
-  /**
-   * Điền item_code/item_name vào STG - Chỉ lọc và cập nhật theo kỳ (Period Scope)
-   */
   updateStagingMappedFields(sourceGroup, periodList = null) {
     const srcMeta = this.sysConfigService.getSourceMetadata(sourceGroup);
     if (!srcMeta) return 0;
@@ -579,7 +460,6 @@ class DataStagingService {
       itemCode:  this._getColIndex("MAP_RULE", "item_code")
     };
 
-    // Cache bảng MAP_RULE vào Map
     const mapDict = new Map();
     const mrRows = mapRuleInfo.values.slice(1);
     for (let i = 0; i < mrRows.length; i++) {
@@ -594,9 +474,8 @@ class DataStagingService {
       }
     }
 
-    // Khởi tạo Set các kỳ cần xử lý (Nếu periodList null -> Mới chạy toàn bộ)
     const targetPeriods = (Array.isArray(periodList) && periodList.length > 0)
-      ? new Set(periodList.map(v => String(v).trim()))
+      ? new Set(periodList.map(v => this._normalizePeriod(v)))
       : null;
 
     const stgRows = stgDataInfo.values.slice(1);
@@ -606,9 +485,9 @@ class DataStagingService {
     for (let i = 0; i < stgRows.length; i++) {
       const row = stgRows[i];
 
-      // BỎ QUA NẾU KHÔNG THUỘC KỲ ĐANG XỬ LÝ
+      // BỎ QUA CÁC KỲ KHÔNG ĐƯỢC CHỌN (VD: KỲ 202609)
       if (targetPeriods && idxSTG.period !== -1) {
-        const periodVal = String(row[idxSTG.period] || "").trim();
+        const periodVal = this._normalizePeriod(row[idxSTG.period]);
         if (!targetPeriods.has(periodVal)) continue;
       }
 
@@ -618,7 +497,6 @@ class DataStagingService {
         const currentName = idxSTG.itemName !== -1 ? String(row[idxSTG.itemName] || "").trim() : "";
         const currentCode = idxSTG.itemCode !== -1 ? String(row[idxSTG.itemCode] || "").trim() : "";
 
-        // Chỉ đưa vào mảng cập nhật nếu giá trị có sự thay đổi
         if (currentName !== mapped.itemName || currentCode !== mapped.itemCode) {
           const updatedRow = [...row];
           if (idxSTG.itemName !== -1) updatedRow[idxSTG.itemName] = mapped.itemName;
@@ -629,7 +507,6 @@ class DataStagingService {
       }
     }
 
-    // Chỉ ghi đè lại những dòng bị thay đổi thuộc kỳ được chỉ định
     if (modifiedStgRows.length > 0) {
       this.tableRepo.upsertRowsByTableName(stgSchemaName, modifiedStgRows, srcMeta.primaryKeys);
     }
