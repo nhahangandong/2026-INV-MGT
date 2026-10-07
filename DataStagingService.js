@@ -1,5 +1,6 @@
 /**
- * [SERVICE] DataStagingService - Sửa triệt để lỗi xóa item_name, item_code ở các kỳ khác
+ * [SERVICE] DataStagingService - Đã refactor theo Lược đồ MAP_RULE mới (status, updated_at)
+ * và hỗ trợ Cascade Update khi Re-apply Auto Rules.
  */
 class DataStagingService {
   constructor(tableRepo, schemaService, sysConfigService) {
@@ -82,6 +83,12 @@ class DataStagingService {
     return col1Based > 0 ? col1Based - 1 : -1;
   }
 
+  _getNowFormatted() {
+    const now = new Date();
+    const pad = (n) => (n < 10 ? "0" + n : n);
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  }
+
   /**
    * Pipeline chính
    */
@@ -101,10 +108,10 @@ class DataStagingService {
     // 1. Chuyển RAW -> STG
     const transformedCount = this.transformRawToStaging(sourceGroup, periodList);
     
-    // 2. KHÔI PHỤC: Khởi tạo trước các cặp (source_grp, raw_name) vào MAP_RULE
+    // 2. Khởi tạo các cặp (source_grp, raw_name) vào MAP_RULE với status = 'PENDING'
     this.bootstrapMapRules(sourceGroup, periodList);
 
-    // 3. Gợi ý ánh xạ MAP_RULE dựa trên AUTO_MAP_RULE
+    // 3. Gợi ý ánh xạ MAP_RULE dựa trên AUTO_MAP_RULE (Chỉ áp dụng cho dòng PENDING)
     this.applyAutoMapNamesToMapRules(sourceGroup, periodList);
 
     // 4. Tạo mã item_code & Đồng bộ ITEM_MASTER
@@ -127,6 +134,102 @@ class DataStagingService {
       transformedCount: transformedCount,
       updatedCount: updatedCount
     };
+  }
+
+  /**
+   * Khởi tạo các dòng MAP_RULE ban đầu cho các raw_name xuất hiện trong RAW thuộc kỳ đang lọc
+   */
+  bootstrapMapRules(sourceGroup, periodList = null) {
+    const srcMeta = this.sysConfigService.getSourceMetadata(sourceGroup);
+    if (!srcMeta) return 0;
+
+    const targetGrp = (srcMeta.mapRuleGroup || srcMeta.coreGroup || sourceGroup).toUpperCase();
+    const rawSchemaName = srcMeta.rawSchema;
+
+    const rawDataInfo = this.tableRepo.getDataByTableName(rawSchemaName);
+    if (!rawDataInfo || !rawDataInfo.values || rawDataInfo.values.length <= 1) return 0;
+
+    const idxRawName = this._getColIndex(rawSchemaName, "raw_name");
+    const idxRawPeriod = this._getColIndex(rawSchemaName, "period");
+
+    if (idxRawName === -1) return 0;
+
+    const periodSet = (Array.isArray(periodList) && periodList.length > 0)
+      ? new Set(periodList.map(p => this._normalizePeriod(p)))
+      : null;
+
+    // 1. Quét RAW để gom nhóm các raw_name duy nhất trong kỳ xử lý
+    const uniqueRawNamesInRaw = new Set();
+    const rawRows = rawDataInfo.values.slice(1);
+
+    for (let i = 0; i < rawRows.length; i++) {
+      const row = rawRows[i];
+
+      if (periodSet && idxRawPeriod !== -1) {
+        const periodVal = this._normalizePeriod(row[idxRawPeriod]);
+        if (!periodSet.has(periodVal)) continue;
+      }
+
+      const rawName = String(row[idxRawName] || "").trim();
+      if (rawName) {
+        uniqueRawNamesInRaw.add(rawName);
+      }
+    }
+
+    if (uniqueRawNamesInRaw.size === 0) return 0;
+
+    // 2. Kiểm tra các cặp (source_grp, raw_name) đã tồn tại trong MAP_RULE
+    const mapRuleInfo = this.tableRepo.getDataByTableName("MAP_RULE");
+    const existingKeys = new Set();
+
+    const schemaMap = this.schemaService.getSchemaMap();
+    const mrColsConfig = schemaMap["MAP_RULE"] ? schemaMap["MAP_RULE"].columns : {};
+    const totalMRCols = Math.max(...Object.values(mrColsConfig), 6);
+
+    const idxMR = {
+      sourceGrp: this._getColIndex("MAP_RULE", "source_grp"),
+      rawName:   this._getColIndex("MAP_RULE", "raw_name"),
+      itemName:  this._getColIndex("MAP_RULE", "item_name"),
+      itemCode:  this._getColIndex("MAP_RULE", "item_code"),
+      status:    this._getColIndex("MAP_RULE", "status"),
+      updatedAt: this._getColIndex("MAP_RULE", "updated_at")
+    };
+
+    if (mapRuleInfo && mapRuleInfo.values && mapRuleInfo.values.length > 1) {
+      const mrRows = mapRuleInfo.values.slice(1);
+      for (let i = 0; i < mrRows.length; i++) {
+        const grp = String(mrRows[i][idxMR.sourceGrp] || "").trim().toUpperCase();
+        const raw = String(mrRows[i][idxMR.rawName] || "").trim().toLowerCase();
+        if (grp && raw) {
+          existingKeys.add(`${grp}___${raw}`);
+        }
+      }
+    }
+
+    // 3. Khởi tạo dòng mới vào MAP_RULE nếu chưa tồn tại (Bổ sung status = 'PENDING')
+    const rowsToInsert = [];
+    const nowStr = this._getNowFormatted();
+
+    uniqueRawNamesInRaw.forEach(rawName => {
+      const key = `${targetGrp}___${rawName.toLowerCase()}`;
+      if (!existingKeys.has(key)) {
+        const newRow = new Array(totalMRCols).fill("");
+        if (idxMR.sourceGrp !== -1) newRow[idxMR.sourceGrp] = targetGrp;
+        if (idxMR.rawName !== -1)   newRow[idxMR.rawName]   = rawName;
+        if (idxMR.status !== -1)    newRow[idxMR.status]    = "PENDING";
+        if (idxMR.updatedAt !== -1) newRow[idxMR.updatedAt] = nowStr;
+        
+        rowsToInsert.push(newRow);
+        existingKeys.add(key);
+      }
+    });
+
+    if (rowsToInsert.length > 0) {
+      this.tableRepo.upsertRowsByTableName("MAP_RULE", rowsToInsert, ["source_grp", "raw_name"]);
+      Logger.log(`[BOOTSTRAP MAP_RULE] Đã khởi tạo mới ${rowsToInsert.length} bản ghi vào MAP_RULE cho nhóm [${targetGrp}].`);
+    }
+
+    return rowsToInsert.length;
   }
 
   transformRawToStaging(sourceGroup, periodList = null, overridePrimaryKeys = null) {
@@ -215,7 +318,8 @@ class DataStagingService {
   }
 
   /**
-   * Áp dụng quy tắc Map - Đã sửa lỗi quét full RAW làm mất dữ liệu kỳ khác
+   * Áp dụng quy tắc Auto Map vào MAP_RULE
+   * Đã Refactor: Chỉ cập nhật các dòng đang ở trạng thái 'PENDING' (bỏ qua APPROVED/IGNORED)
    */
   applyAutoMapNamesToMapRules(sourceGroup, periodList = null) {
     const srcMeta = this.sysConfigService.getSourceMetadata(sourceGroup) || {};
@@ -231,7 +335,9 @@ class DataStagingService {
     const idxMR = {
       sourceGrp: this._getColIndex("MAP_RULE", "source_grp"),
       rawName:   this._getColIndex("MAP_RULE", "raw_name"),
-      itemName:  this._getColIndex("MAP_RULE", "item_name")
+      itemName:  this._getColIndex("MAP_RULE", "item_name"),
+      status:    this._getColIndex("MAP_RULE", "status"),
+      updatedAt: this._getColIndex("MAP_RULE", "updated_at")
     };
 
     let kwIdx = this._getColIndex("AUTO_MAP_RULE", "keywords");
@@ -274,7 +380,6 @@ class DataStagingService {
       if (idxRawName !== -1) {
         const rRows = rawDataInfo.values.slice(1);
         for (let i = 0; i < rRows.length; i++) {
-          // BỔ SUNG LỌC THEO KỲ TẠI ĐÂY
           if (periodSet && idxRawPeriod !== -1) {
             const periodVal = this._normalizePeriod(rRows[i][idxRawPeriod]);
             if (!periodSet.has(periodVal)) continue; 
@@ -289,17 +394,21 @@ class DataStagingService {
     const mapRows = mapRuleInfo.values.slice(1);
     const modifiedRows = [];
     let updatedCount = 0;
+    const nowStr = this._getNowFormatted();
 
     for (let i = 0; i < mapRows.length; i++) {
       const row = mapRows[i];
       const rowSourceGrp = String(row[idxMR.sourceGrp] || "").trim().toUpperCase();
       if (targetGrp && rowSourceGrp !== targetGrp) continue;
 
+      // KIỂM TRA STATUS: Chỉ tự động map nếu dòng đang là PENDING hoặc chưa có status
+      const statusVal = idxMR.status !== -1 ? String(row[idxMR.status] || "").trim().toUpperCase() : "PENDING";
+      if (statusVal && statusVal !== "PENDING") continue;
+
       const rawName = String(row[idxMR.rawName] || "").trim();
       const rawNameLower = rawName.toLowerCase();
       let currentItemName = String(row[idxMR.itemName] || "").trim();
 
-      // Nếu có bộ lọc Kỳ, chỉ kiểm tra các rawName có mặt trong kỳ đó
       if (activeRawNamesInSource.size > 0 && !activeRawNamesInSource.has(rawNameLower)) {
         continue;
       }
@@ -310,14 +419,18 @@ class DataStagingService {
         return rule.regExps.length > 0 && rule.regExps.some(rx => rx.test(rawName));
       });
 
+      let newItemName = currentItemName;
       if (matchedRule) {
-        if (currentItemName !== matchedRule.itemName) {
-          row[idxMR.itemName] = matchedRule.itemName;
-          updatedCount++;
-          modifiedRows.push(row);
-        }
+        newItemName = matchedRule.itemName;
       } else if (!currentItemName) {
-        row[idxMR.itemName] = rawName;
+        newItemName = rawName;
+      }
+
+      if (newItemName !== currentItemName || !row[idxMR.status]) {
+        row[idxMR.itemName] = newItemName;
+        if (idxMR.status !== -1)    row[idxMR.status] = "PENDING";
+        if (idxMR.updatedAt !== -1) row[idxMR.updatedAt] = nowStr;
+
         updatedCount++;
         modifiedRows.push(row);
       }
@@ -334,7 +447,7 @@ class DataStagingService {
     const itemMasterInfo = this.tableRepo.getDataByTableName("ITEM_MASTER");
     const mapRuleInfo    = this.tableRepo.getDataByTableName("MAP_RULE");
 
-    if (!mapRuleInfo || !mapRuleInfo.values || mapRuleInfo.values.length <= 1) return 0;
+    if (!mapRuleInfo || !mapRuleInfo.values || mapRuleInfo.values.length <= 1) return { generatedCount: 0, oldToNewCodeMap: new Map() };
 
     const schemaMap = this.schemaService.getSchemaMap();
     const imColsConfig = schemaMap["ITEM_MASTER"] ? schemaMap["ITEM_MASTER"].columns : {};
@@ -351,7 +464,9 @@ class DataStagingService {
       sourceGrp: this._getColIndex("MAP_RULE", "source_grp"),
       rawName:   this._getColIndex("MAP_RULE", "raw_name"),
       itemName:  this._getColIndex("MAP_RULE", "item_name"),
-      itemCode:  this._getColIndex("MAP_RULE", "item_code")
+      itemCode:  this._getColIndex("MAP_RULE", "item_code"),
+      status:    this._getColIndex("MAP_RULE", "status"),
+      updatedAt: this._getColIndex("MAP_RULE", "updated_at")
     };
 
     const existingIMMap = new Map();
@@ -370,6 +485,8 @@ class DataStagingService {
     const newMasterRowsMap = new Map();
     const activeCodeSet = new Set();
     const modifiedMapRows = [];
+    const oldToNewCodeMap = new Map();
+    const nowStr = this._getNowFormatted();
     let generatedCount = 0;
 
     const generatedBaseCodesDict = new Map();
@@ -378,6 +495,7 @@ class DataStagingService {
       const row = mapRows[i];
       const sourceGrp = String(row[idxMR.sourceGrp] || "INT").trim().toUpperCase();
       const itemName  = String(row[idxMR.itemName] || "").trim();
+      const oldCode   = String(row[idxMR.itemCode] || "").trim();
 
       if (!itemName) continue;
 
@@ -406,8 +524,13 @@ class DataStagingService {
 
       activeCodeSet.add(correctCode);
 
-      if (row[idxMR.itemCode] !== correctCode) {
+      if (oldCode !== correctCode) {
+        if (oldCode) {
+          oldToNewCodeMap.set(oldCode, { newCode: correctCode, newName: itemName });
+        }
+
         row[idxMR.itemCode] = correctCode;
+        if (idxMR.updatedAt !== -1) row[idxMR.updatedAt] = nowStr;
         modifiedMapRows.push(row);
         generatedCount++;
       }
@@ -432,7 +555,7 @@ class DataStagingService {
       this.tableRepo.upsertRowsByTableName("ITEM_MASTER", Array.from(newMasterRowsMap.values()), ["item_code"]);
     }
 
-    return generatedCount;
+    return { generatedCount, oldToNewCodeMap };
   }
 
   updateStagingMappedFields(sourceGroup, periodList = null) {
@@ -487,7 +610,6 @@ class DataStagingService {
     for (let i = 0; i < stgRows.length; i++) {
       const row = stgRows[i];
 
-      // BỎ QUA CÁC KỲ KHÔNG ĐƯỢC CHỌN (VD: KỲ 202609)
       if (targetPeriods && idxSTG.period !== -1) {
         const periodVal = this._normalizePeriod(row[idxSTG.period]);
         if (!targetPeriods.has(periodVal)) continue;
@@ -733,96 +855,169 @@ class DataStagingService {
   }
 
   /**
-   * Khởi tạo các dòng MAP_RULE ban đầu cho các raw_name xuất hiện trong RAW thuộc kỳ đang lọc
+   * BỔ SUNG: Chạy lại Auto Map Rules cho các dòng MAP_RULE ở trạng thái PENDING
+   * Có hỗ trợ Cascade Update mã item_code cũ -> mới xuống các bảng STG & UNIT_CONVERSION
    */
-  bootstrapMapRules(sourceGroup, periodList = null) {
-    const srcMeta = this.sysConfigService.getSourceMetadata(sourceGroup);
-    if (!srcMeta) return 0;
+  reapplyAutoMapRules(sourceGroup, periodList = null) {
+    Logger.log(`[RE-APPLY AUTO MAP] Bắt đầu chạy lại quy tắc cho nhóm: ${sourceGroup}`);
+    
+    // 1. Chạy lại Auto Map trên các bản ghi PENDING của MAP_RULE
+    this.applyAutoMapNamesToMapRules(sourceGroup, periodList);
 
-    const targetGrp = (srcMeta.mapRuleGroup || srcMeta.coreGroup || sourceGroup).toUpperCase();
-    const rawSchemaName = srcMeta.rawSchema;
+    // 2. Tạo lại item_code và thu thập danh sách biến đổi mã (oldToNewCodeMap)
+    const { oldToNewCodeMap } = this.generateAndSyncItemCodes();
 
-    const rawDataInfo = this.tableRepo.getDataByTableName(rawSchemaName);
-    if (!rawDataInfo || !rawDataInfo.values || rawDataInfo.values.length <= 1) return 0;
-
-    const idxRawName = this._getColIndex(rawSchemaName, "raw_name");
-    const idxRawPeriod = this._getColIndex(rawSchemaName, "period");
-
-    if (idxRawName === -1) return 0;
-
-    const periodSet = (Array.isArray(periodList) && periodList.length > 0)
-      ? new Set(periodList.map(p => this._normalizePeriod(p)))
-      : null;
-
-    // 1. Quét RAW để gom nhóm các raw_name duy nhất trong kỳ xử lý
-    const uniqueRawNamesInRaw = new Set();
-    const rawRows = rawDataInfo.values.slice(1);
-
-    for (let i = 0; i < rawRows.length; i++) {
-      const row = rawRows[i];
-
-      if (periodSet && idxRawPeriod !== -1) {
-        const periodVal = this._normalizePeriod(row[idxRawPeriod]);
-        if (!periodSet.has(periodVal)) continue;
-      }
-
-      const rawName = String(row[idxRawName] || "").trim();
-      if (rawName) {
-        uniqueRawNamesInRaw.add(rawName);
-      }
+    // 3. Thực hiện Cascade Update nếu có mã biến đổi
+    if (oldToNewCodeMap.size > 0) {
+      this._cascadeUpdateItemCodes(oldToNewCodeMap);
     }
 
-    if (uniqueRawNamesInRaw.size === 0) return 0;
+    // 4. Cập nhật lại các trường Mapped vào STG
+    const updatedCount = this.updateStagingMappedFields(sourceGroup, periodList);
 
-    // 2. Kiểm tra các cặp (source_grp, raw_name) đã tồn tại trong MAP_RULE
-    const mapRuleInfo = this.tableRepo.getDataByTableName("MAP_RULE");
-    const existingKeys = new Set();
+    // 5. Cập nhật lại Quy đổi đơn vị & SKU
+    this.bootstrapUnitConversionFromStaging();
+    this.applyAutoSkuRules();
 
-    const schemaMap = this.schemaService.getSchemaMap();
-    const mrColsConfig = schemaMap["MAP_RULE"] ? schemaMap["MAP_RULE"].columns : {};
-    const totalMRCols = Math.max(...Object.values(mrColsConfig), 4);
+    return updatedCount;
+  }
 
-    const idxMR = {
-      sourceGrp: this._getColIndex("MAP_RULE", "source_grp"),
-      rawName:   this._getColIndex("MAP_RULE", "raw_name"),
-      itemName:  this._getColIndex("MAP_RULE", "item_name"),
-      itemCode:  this._getColIndex("MAP_RULE", "item_code")
-    };
+  /**
+   * HELPER: Cập nhật dây chuyền (Cascade Update) khi mã item_code bị biến đổi
+   */
+  _cascadeUpdateItemCodes(oldToNewCodeMap) {
+    if (!oldToNewCodeMap || oldToNewCodeMap.size === 0) return;
 
-    if (mapRuleInfo && mapRuleInfo.values && mapRuleInfo.values.length > 1) {
-      const mrRows = mapRuleInfo.values.slice(1);
-      for (let i = 0; i < mrRows.length; i++) {
-        const grp = String(mrRows[i][idxMR.sourceGrp] || "").trim().toUpperCase();
-        const raw = String(mrRows[i][idxMR.rawName] || "").trim().toLowerCase();
-        if (grp && raw) {
-          existingKeys.add(`${grp}___${raw}`);
+    Logger.log(`[CASCADE UPDATE] Đang đồng bộ dây chuyền cho ${oldToNewCodeMap.size} mã item_code thay đổi...`);
+
+    // 1. Cascade Update xuống các bảng STG
+    const stgTables = ["STG_PO_INVOICE", "STG_SO_INVOICE"];
+    stgTables.forEach(tableName => {
+      const stgData = this.tableRepo.getDataByTableName(tableName);
+      if (!stgData || !stgData.values || stgData.values.length <= 1) return;
+
+      const codeIdx = this._getColIndex(tableName, "item_code");
+      const nameIdx = this._getColIndex(tableName, "item_name");
+      if (codeIdx === -1) return;
+
+      const rows = stgData.values.slice(1);
+      const modifiedRows = [];
+
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        const currentCode = String(r[codeIdx] || "").trim();
+
+        if (oldToNewCodeMap.has(currentCode)) {
+          const updatedRow = [...r];
+          const newInfo = oldToNewCodeMap.get(currentCode);
+          updatedRow[codeIdx] = newInfo.newCode;
+          if (nameIdx !== -1) updatedRow[nameIdx] = newInfo.newName;
+          modifiedRows.push(updatedRow);
         }
       }
-    }
 
-    // 3. Khởi tạo dòng mới vào MAP_RULE nếu chưa tồn tại
-    const rowsToInsert = [];
-    uniqueRawNamesInRaw.forEach(rawName => {
-      const key = `${targetGrp}___${rawName.toLowerCase()}`;
-      if (!existingKeys.has(key)) {
-        const newRow = new Array(totalMRCols).fill("");
-        if (idxMR.sourceGrp !== -1) newRow[idxMR.sourceGrp] = targetGrp;
-        if (idxMR.rawName !== -1)   newRow[idxMR.rawName]   = rawName;
-        // item_name và item_code để trống, các bước sau trong Pipeline sẽ điền/map tiếp
-        
-        rowsToInsert.push(newRow);
-        existingKeys.add(key);
+      if (modifiedRows.length > 0) {
+        const srcMeta = this.sysConfigService.getSourceMetadataByStgSchema(tableName);
+        const pk = srcMeta && srcMeta.primaryKeys ? srcMeta.primaryKeys : ["period", "line_id"];
+        this.tableRepo.upsertRowsByTableName(tableName, modifiedRows, pk);
       }
     });
 
-    if (rowsToInsert.length > 0) {
-      this.tableRepo.upsertRowsByTableName("MAP_RULE", rowsToInsert, ["source_grp", "raw_name"]);
-      Logger.log(`[BOOTSTRAP MAP_RULE] Đã khởi tạo mới ${rowsToInsert.length} bản ghi vào MAP_RULE cho nhóm [${targetGrp}].`);
-    }
+    // 2. Cascade Update xuống UNIT_CONVERSION
+    const ucData = this.tableRepo.getDataByTableName("UNIT_CONVERSION");
+    if (ucData && ucData.values && ucData.values.length > 1) {
+      const ucCodeIdx = this._getColIndex("UNIT_CONVERSION", "item_code");
+      if (ucCodeIdx !== -1) {
+        const ucRows = ucData.values.slice(1);
+        const modifiedUcRows = [];
 
-    return rowsToInsert.length;
+        for (let i = 0; i < ucRows.length; i++) {
+          const r = ucRows[i];
+          const oldCode = String(r[ucCodeIdx] || "").trim();
+          if (oldToNewCodeMap.has(oldCode)) {
+            const updatedRow = [...r];
+            updatedRow[ucCodeIdx] = oldToNewCodeMap.get(oldCode).newCode;
+            modifiedUcRows.push(updatedRow);
+          }
+        }
+
+        if (modifiedUcRows.length > 0) {
+          this.tableRepo.upsertRowsByTableName("UNIT_CONVERSION", modifiedUcRows, ["source_grp", "item_code", "alt_unit"]);
+        }
+      }
+    }
   }
 
+ 
+  /**
+   * =========================================================================
+   * LUỒNG 1: DÙNG CHO MENU 2 - RUN STAGING FAST (Ingestion Hàng Ngày)
+   * =========================================================================
+   */
+  runStagingFast(sourceGroup, filters = null) {
+    const t0 = Date.now();
+    this._clearCache();
+    Logger.log(`[MENU 2 - FAST STAGING] Nguồn: ${sourceGroup}`);
+
+    let periodList = this._extractPeriodList(filters);
+
+    // 1. RAW -> STG (Thô sang Staging)
+    const transformedCount = this.transformRawToStaging(sourceGroup, periodList);
+  
+    // 2. Khởi tạo các raw_name mới xuất hiện vào MAP_RULE (mặc định PENDING)
+    this.bootstrapMapRules(sourceGroup, periodList);
+
+    // 3. Khớp nhanh AUTO_MAP_RULE cho những dòng PENDING vừa tạo
+    this.applyAutoMapNamesToMapRules(sourceGroup, periodList);
+
+    // 4. Sinh item_code cho các dòng PENDING (Chỉ tạo mã mới nếu chưa có)
+    this.generateAndSyncItemCodes();
+
+    // 5. Cập nhật item_code/item_name vào STG của kỳ hiện tại
+    const updatedCount = this.updateStagingMappedFields(sourceGroup, periodList);
+
+    // 6. Quy đổi ĐVT & Auto SKU đơn giản
+    this.bootstrapUnitConversionFromStaging(sourceGroup);
+    this.applyAutoSkuRules();
+
+    this._clearCache();
+    Logger.log(`[MENU 2 - COMPLETED] Hoàn tất ${transformedCount} dòng trong ${Date.now() - t0} ms.`);
+    return { transformedCount, updatedCount };
+  }
+
+  /**
+   * =========================================================================
+   * LUỒNG 2: DÙNG CHO MENU 3 - RE-SYNC & CASCADE UPDATE (Khi sửa Rule/Mã)
+   * =========================================================================
+   */
+  runFullReSyncPipeline(sourceGroup = null, periodList = null) {
+    const t0 = Date.now();
+    this._clearCache();
+    Logger.log(`[MENU 3 - FULL RE-SYNC] Bắt đầu đồng bộ lại toàn bộ hệ thống...`);
+
+    // 1. Chạy lại Auto Map Rules cho tất cả dòng PENDING
+    this.applyAutoMapNamesToMapRules(sourceGroup, periodList);
+
+    // 2. Tạo mã & thu thập danh sách các mã bị biến đổi (Old -> New)
+    const { oldToNewCodeMap } = this.generateAndSyncItemCodes();
+
+    // 3. ĐỒNG BỘ DÂY CHUYỀN: Nếu có mã bị đổi, quét ghi đè lên toàn bộ STG & UNIT_CONVERSION
+    if (oldToNewCodeMap && oldToNewCodeMap.size > 0) {
+      Logger.log(`[MENU 3] Phát hiện ${oldToNewCodeMap.size} mã đổi. Đang Cascade Update...`);
+      this._cascadeUpdateItemCodes(oldToNewCodeMap);
+    }
+
+    // 4. Áp ngược lại toàn bộ item_code/item_name đã chuẩn hóa sang STG
+    const updatedCount = this.updateStagingMappedFields(sourceGroup, periodList);
+
+    // 5. Đồng bộ lại ITEM_MASTER & UNIT_CONVERSION
+    this.bootstrapUnitConversionFromStaging(sourceGroup);
+    this.applyAutoSkuRules(true); // overwriteExisting = true
+
+    this._clearCache();
+    Logger.log(`[MENU 3 - COMPLETED] Đồng bộ toàn hệ thống hoàn tất trong ${Date.now() - t0} ms.`);
+    return updatedCount;
+  }
 
 
 
